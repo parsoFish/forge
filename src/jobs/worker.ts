@@ -480,6 +480,34 @@ export class Worker {
         }
       } catch { /* proceed if we can't check */ }
 
+      // Dependency gate: if this PR depends on other PRs that are still open,
+      // defer it. Reviewing/fixing dependent PRs before their parents merge
+      // wastes effort — they'll have conflicts that resolve automatically
+      // once the parent merges.
+      const dependsOnPRs = (job.metadata.dependsOnPRs as number[] | undefined) ?? [];
+      if (dependsOnPRs.length > 0) {
+        try {
+          const stillOpen = dependsOnPRs.filter((depPr) => {
+            try {
+              const depState = execSync(
+                `gh pr view ${depPr} --repo ${repo} --json state --jq .state`,
+                { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+              ).trim();
+              return depState === 'OPEN';
+            } catch { return false; } // Can't check — assume not blocking
+          });
+          if (stillOpen.length > 0) {
+            console.log(chalk.dim(`  PR #${prNumber}: deferred — depends on open PR(s) ${stillOpen.map(n => `#${n}`).join(', ')}`));
+            this.eventLog.emit({
+              type: 'review.complete',
+              project,
+              summary: `PR #${prNumber} deferred: waiting for parent PR(s) ${stillOpen.join(', ')} to merge`,
+            });
+            return;
+          }
+        } catch { /* if dependency check fails, proceed anyway */ }
+      }
+
       const pr = {
         number:        prNumber,
         title:         job.metadata.prTitle as string ?? `PR #${prNumber}`,
@@ -648,16 +676,29 @@ export class Worker {
    project's CLAUDE.md, core values, and test suite to decide the right resolution.
    After resolving: \`git add <resolved files> && git commit -m "fix: resolve merge conflicts with main"\`
 
-2. Read the latest review comments on this PR:
+2. Check CI status and inspect any failures:
+   \`\`\`bash
+   gh pr checks ${prNumber} --repo ${repo} 2>&1
+   \`\`\`
+   If any checks failed, get the failure logs:
+   \`\`\`bash
+   # Get the failed run ID from the checks output, then:
+   gh run view <run-id> --repo ${repo} --log-failed 2>&1 | tail -50
+   \`\`\`
+   CI failures are often the real blocker. Fix these alongside reviewer feedback.
+
+3. Read the latest review comments on this PR:
    \`gh api repos/${repo}/issues/${prNumber}/comments --jq '.[-3:] | .[] | {user: .user.login, body: .body[:500]}'\`
 
-3. Understand what was flagged as a blocker or concern.
+4. Understand what was flagged — both from reviewer comments AND CI failures.
 
-4. Fix ONLY what was requested — do not refactor or add features.
+5. Fix what's needed. If CI is failing due to missing CI config (e.g. missing
+   tool installation in workflow), fix the workflow file. If tests fail, fix
+   the code. Do not refactor or add features beyond what's needed.
 
-5. Run the project's test suite to verify nothing breaks.
+6. Run the project's test suite locally to verify nothing breaks.
 
-6. Commit and push:
+7. Commit and push:
    \`\`\`bash
    git add <changed files>
    git commit -m "fix: address reviewer feedback on PR #${prNumber}
@@ -669,7 +710,7 @@ export class Worker {
    git push origin ${branch}
    \`\`\`
 
-7. VERIFY the push landed (MANDATORY):
+8. VERIFY the push landed (MANDATORY):
    \`\`\`bash
    LOCAL_SHA=$(git rev-parse HEAD)
    REMOTE_SHA=$(gh api repos/${repo}/pulls/${prNumber} --jq .head.sha)
