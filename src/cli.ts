@@ -102,6 +102,25 @@ program
   });
 
 program
+  .command('fix <pr-number>')
+  .description('Queue a fix job for a PR — starts the autonomous review/fix loop')
+  .requiredOption('-p, --project <name>', 'Project the PR belongs to')
+  .action(async (prNumberStr: string, opts: { project: string }) => {
+    try {
+      const prNumber = parseInt(prNumberStr, 10);
+      if (isNaN(prNumber)) {
+        console.error(chalk.red(`Invalid PR number: ${prNumberStr}`));
+        process.exit(1);
+      }
+      const orch = new Orchestrator();
+      await orch.fix(prNumber, opts.project);
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
   .command('reflect')
   .description('Queue a reflection/learning job (exits immediately)')
   .action(async () => {

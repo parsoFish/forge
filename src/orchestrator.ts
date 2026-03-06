@@ -302,6 +302,67 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * Queue a fix job for a specific PR — kicks off the autonomous
+   * review→fix→re-review loop starting from round 1.
+   *
+   * Called by the user after they've seen the initial review and want
+   * the system to autonomously resolve the feedback.
+   */
+  async fix(prNumber: number, projectName: string): Promise<void> {
+    this.validateProject(projectName);
+
+    // Look up PR metadata via gh
+    const { execSync } = await import('node:child_process');
+    const projectPath = resolve(this.settings.workspaceRoot, projectName);
+
+    let prData: { branch: string; repo: string; title: string; headSha: string };
+    try {
+      const json = execSync(
+        `gh pr view ${prNumber} --json headRefName,headRepository,headRepositoryOwner,title,headRefOid`,
+        { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      ).trim();
+      const parsed = JSON.parse(json) as {
+        headRefName: string;
+        headRepository: { name: string };
+        headRepositoryOwner: { login: string };
+        title: string;
+        headRefOid: string;
+      };
+      prData = {
+        branch: parsed.headRefName,
+        repo: `${parsed.headRepositoryOwner.login}/${parsed.headRepository.name}`,
+        title: parsed.title,
+        headSha: parsed.headRefOid,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`  Could not look up PR #${prNumber}: ${msg}`));
+      process.exit(1);
+    }
+
+    const job = this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, projectName, {
+      prNumber,
+      repo: prData.repo,
+      project: projectName,
+      branch: prData.branch,
+      prTitle: prData.title,
+      fixRound: 1,
+      lastReviewedSha: prData.headSha,
+    }, 12);
+
+    console.log(chalk.bold.blue(`\n▶ Fix: queued pr-fix job for PR #${prNumber} (${prData.title})`));
+    console.log(chalk.dim(`    Branch: ${prData.branch} | Repo: ${prData.repo}`));
+    console.log(chalk.dim(`    Fix round: 1 — autonomous loop will run until approved or max rounds hit`));
+    console.log(chalk.dim(`    Job: ${job.id}`));
+    this.printWorkerHint();
+
+    this.eventLog.emit({
+      type: 'jobs.queued',
+      summary: `Queued pr-fix for PR #${prNumber} in ${projectName} (round 1, autonomous)`,
+    });
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // Legacy / Convenience Commands
   // ═══════════════════════════════════════════════════════════════════

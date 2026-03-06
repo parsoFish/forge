@@ -266,11 +266,19 @@ export class Worker {
 
     // Print recommendations (interactive — user decides)
     if (report.recommendations.length > 0) {
-      console.log(chalk.yellow('\n  Tuning suggestions (apply in forge.config.json → resourceThresholds.resourceSlots):'));
+      console.log(chalk.yellow('\n  Tuning suggestions for forge.config.json:'));
       for (const rec of report.recommendations) {
         const arrow = rec.suggestedCapacity > rec.currentCapacity ? '↑' : '↓';
-        console.log(chalk.yellow(`    ${arrow} "${rec.slot}": ${rec.currentCapacity} → ${rec.suggestedCapacity} — ${rec.reason}`));
+        console.log(chalk.yellow(`    ${arrow} ${rec.slot}: ${rec.currentCapacity} → ${rec.suggestedCapacity} — ${rec.reason}`));
       }
+
+      // Show the JSON snippet to paste into config
+      const slotOverrides: Record<string, { capacity: number }> = {};
+      for (const rec of report.recommendations) {
+        slotOverrides[rec.slot] = { capacity: rec.suggestedCapacity };
+      }
+      console.log(chalk.dim('\n  Add to forge.config.json:'));
+      console.log(chalk.dim(`  "resourceThresholds": { "resourceSlots": ${JSON.stringify(slotOverrides)} }`));
       console.log();
     } else if (report.totalSamples > 0) {
       console.log(chalk.green('  No tuning changes suggested — current config looks good.\n'));
@@ -496,8 +504,17 @@ export class Worker {
       });
 
       // Parse the agent's output to decide the next step in the bounce cycle.
-      // "REVIEW POSTED: changes-requested" → post pr-fix job (capped at MAX_FIX_ROUNDS)
-      // "REVIEW POSTED: approved" → reviewer agent handles merge; nothing more to queue
+      //
+      // Round 0 (initial review): DON'T auto-queue fix — let the user see the
+      //   review and provide their own feedback first. This is one of the two
+      //   interactive leverage points (roadmapping + PR review).
+      //
+      // Round 1+ (re-review after fix): Let it ride autonomously. The reviewer
+      //   queues fixes, the fixer pushes and queues re-reviews, until either
+      //   approved or MAX_FIX_ROUNDS is hit.
+      //
+      // "REVIEW POSTED: changes-requested" → queue pr-fix (round 1+) or pause (round 0)
+      // "REVIEW POSTED: approved" → reviewer handles merge; nothing more to queue
       // "REVIEW DEFERRED" → will be re-queued on next `forge review` run
       // "FAILED" / other → no follow-up
       const MAX_FIX_ROUNDS = 3;
@@ -505,20 +522,37 @@ export class Worker {
       const currentRound = (job.metadata.fixRound as number | undefined) ?? 0;
 
       if (/REVIEW POSTED:\s*changes-requested/i.test(output)) {
-        const nextRound = currentRound + 1;
-        if (nextRound > MAX_FIX_ROUNDS) {
-          console.log(chalk.yellow(`  PR #${prNumber} hit max fix rounds (${MAX_FIX_ROUNDS}). Escalating to human.`));
+        if (currentRound === 0) {
+          // First review — pause for human input
+          console.log(chalk.cyan(`  PR #${prNumber}: initial review posted. Waiting for your feedback before auto-fixing.`));
+          console.log(chalk.dim(`    To start the autonomous fix loop: forge fix ${prNumber} --project ${project}`));
           this.eventLog.emit({
             type: 'review.complete',
             project,
-            summary: `PR #${prNumber} exceeded ${MAX_FIX_ROUNDS} fix rounds — needs human attention`,
+            summary: `PR #${prNumber} initial review posted — paused for user feedback`,
           });
         } else {
-          this.queue.post('pr-fix', 'pr-fix' as JobPhase, project, {
-            ...job.metadata,
-            fixRound: nextRound,
-            lastReviewedSha: currentRemoteSha || undefined,
-          }, 12);
+          const nextRound = currentRound + 1;
+          if (nextRound > MAX_FIX_ROUNDS) {
+            // Escalation alert — this PR needs human guidance
+            console.log(chalk.bold.red(`\n  ALERT: PR #${prNumber} (${project}) hit ${MAX_FIX_ROUNDS} fix rounds without resolution.`));
+            console.log(chalk.yellow(`  The reviewer and developer couldn't converge. This PR needs your guidance.`));
+            console.log(chalk.dim(`    Review: https://github.com/${repo}/pull/${prNumber}`));
+            console.log(chalk.dim(`    Resume: forge fix ${prNumber} --project ${project}\n`));
+            this.eventLog.emit({
+              type: 'review.complete',
+              project,
+              summary: `ALERT: PR #${prNumber} exceeded ${MAX_FIX_ROUNDS} fix rounds — needs human guidance`,
+            });
+          } else {
+            // Autonomous loop — queue the fix
+            console.log(chalk.dim(`  PR #${prNumber}: queuing fix round ${nextRound}/${MAX_FIX_ROUNDS}`));
+            this.queue.post('pr-fix', 'pr-fix' as JobPhase, project, {
+              ...job.metadata,
+              fixRound: nextRound,
+              lastReviewedSha: currentRemoteSha || undefined,
+            }, 12);
+          }
         }
       }
       return;
@@ -605,16 +639,25 @@ export class Worker {
 
 ## Your Task
 
-1. Read the latest review comments on this PR:
+1. Check for merge conflicts or branch issues FIRST:
+   \`\`\`bash
+   git fetch origin main
+   git merge origin/main --no-edit 2>&1 || echo "MERGE_CONFLICT"
+   \`\`\`
+   If there are merge conflicts, resolve them. You wrote this code — use the
+   project's CLAUDE.md, core values, and test suite to decide the right resolution.
+   After resolving: \`git add <resolved files> && git commit -m "fix: resolve merge conflicts with main"\`
+
+2. Read the latest review comments on this PR:
    \`gh api repos/${repo}/issues/${prNumber}/comments --jq '.[-3:] | .[] | {user: .user.login, body: .body[:500]}'\`
 
-2. Understand what was flagged as a blocker or concern.
+3. Understand what was flagged as a blocker or concern.
 
-3. Fix ONLY what was requested — do not refactor or add features.
+4. Fix ONLY what was requested — do not refactor or add features.
 
-4. Run the project's test suite to verify nothing breaks.
+5. Run the project's test suite to verify nothing breaks.
 
-5. Commit and push:
+6. Commit and push:
    \`\`\`bash
    git add <changed files>
    git commit -m "fix: address reviewer feedback on PR #${prNumber}
@@ -626,7 +669,7 @@ export class Worker {
    git push origin ${branch}
    \`\`\`
 
-6. VERIFY the push landed (MANDATORY):
+7. VERIFY the push landed (MANDATORY):
    \`\`\`bash
    LOCAL_SHA=$(git rev-parse HEAD)
    REMOTE_SHA=$(gh api repos/${repo}/pulls/${prNumber} --jq .head.sha)
