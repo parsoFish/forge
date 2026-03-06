@@ -153,6 +153,18 @@ export class JobQueue {
     return next;
   }
 
+  /**
+   * Put a claimed (running) job back in the queue.
+   * Used when a job can't start due to resource slot limits.
+   */
+  unclaim(id: string): void {
+    const job = this.get(id);
+    if (!job || job.status !== 'running') return;
+    job.status = 'queued';
+    job.startedAt = undefined;
+    this.save(job);
+  }
+
   /** Mark a job as completed. */
   complete(id: string): void {
     const job = this.get(id);

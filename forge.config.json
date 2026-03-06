@@ -15,7 +15,7 @@
     "maxWeeklyBudgetUsd": 2000,
     "warnAtPercent": 75
   },
-  "maxConcurrency": 3,
+  "maxConcurrency": 5,
   "phaseConcurrency": {
     "designPlan": 2,
     "test": 2,

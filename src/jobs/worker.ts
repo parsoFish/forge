@@ -45,6 +45,21 @@ import { STAGE_AGENT_MAP, type WorkItem } from '../workflow/types.js';
 const POLL_INTERVAL_MS = 3_000;  // Check for new jobs every 3s
 const IDLE_LOG_INTERVAL_MS = 60_000;  // Log "still waiting" every 60s when idle
 
+/**
+ * Maps job types to the resource slots they consume.
+ * Jobs not listed here are "lightweight" and don't need slots.
+ *
+ * This is the single place to express "this job type is heavy because
+ * it launches X". The worker checks slot availability before dispatch,
+ * so 5 agents can run concurrently but at most N of them can be doing
+ * expensive operations like running browsers or dev servers.
+ */
+const JOB_RESOURCE_SLOTS: Readonly<Record<string, readonly string[]>> = {
+  'work-item':  ['build'],              // TDD cycle: compiles, runs tests
+  'pr-fix':     ['build'],              // Fixes + test run
+  'implement':  ['build'],              // Posts work-item sub-jobs (each acquires own slot)
+};
+
 export class Worker {
   private readonly settings: ForgeSettings;
   private readonly store: StateStore;
@@ -149,6 +164,21 @@ export class Worker {
       while (this._activeJobs < maxConcurrency && !this._shutdownRequested) {
         const job = this.queue.claim();
         if (!job) break;  // No more queued jobs
+
+        // Check resource slot availability for heavyweight jobs.
+        // If slots are full, unclaim and skip — it'll be retried next tick.
+        const requiredSlots = JOB_RESOURCE_SLOTS[job.type] ?? [];
+        const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
+        if (blocked) {
+          this.queue.unclaim(job.id);
+          console.log(chalk.dim(`  ⏳ ${job.type} for ${job.project ?? '?'} waiting on "${blocked}" slot`));
+          break; // Don't try more jobs this tick — slots won't free until a job finishes
+        }
+
+        // Acquire all required slots
+        for (const slot of requiredSlots) {
+          this.resources.acquire(slot, job.id);
+        }
 
         claimedAny = true;
 
@@ -270,6 +300,8 @@ export class Worker {
       });
     } finally {
       this._activeJobs--;
+      // Release any resource slots held by this job
+      this.resources.releaseAll(job.id);
     }
   }
 

@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import type { BudgetConfig } from '../budget/budget-tracker.js';
 import { DEFAULT_BUDGET } from '../budget/budget-tracker.js';
 import type { ResourceThresholds } from '../monitor/resource-monitor.js';
-import { DEFAULT_THRESHOLDS } from '../monitor/resource-monitor.js';
+import { DEFAULT_THRESHOLDS, DEFAULT_RESOURCE_SLOTS } from '../monitor/resource-monitor.js';
 
 /**
  * Per-phase concurrency limits.
@@ -129,6 +129,10 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
       resourceThresholds: {
         ...DEFAULT_THRESHOLDS,
         ...(overrides.resourceThresholds ?? {}),
+        resourceSlots: {
+          ...DEFAULT_RESOURCE_SLOTS,
+          ...((overrides.resourceThresholds as Partial<ResourceThresholds> | undefined)?.resourceSlots ?? {}),
+        },
       },
     };
   }

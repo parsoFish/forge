@@ -12,6 +12,20 @@
 
 import { cpus, freemem, totalmem, loadavg } from 'node:os';
 
+/**
+ * Resource slot definitions — named finite-capacity locks for heavyweight
+ * operations that agents may spawn (browsers, dev servers, builds).
+ *
+ * The worker checks slot availability alongside CPU/memory before dispatching.
+ * Agents acquire slots before launching expensive child processes and release
+ * them when done. This prevents 5 concurrent Playwright browsers from
+ * melting the machine even when CPU/memory appear fine at dispatch time.
+ */
+export interface ResourceSlotConfig {
+  /** Maximum concurrent holders of this slot */
+  readonly capacity: number;
+}
+
 export interface ResourceThresholds {
   /** Max CPU load average (1-min) relative to core count. 0.8 = 80% */
   readonly maxLoadFactor: number;
@@ -19,6 +33,8 @@ export interface ResourceThresholds {
   readonly maxMemoryUsage: number;
   /** Cooldown in ms between health checks to avoid thrashing */
   readonly checkIntervalMs: number;
+  /** Named resource slots with capacity limits */
+  readonly resourceSlots: Readonly<Record<string, ResourceSlotConfig>>;
 }
 
 export interface HealthCheck {
@@ -28,12 +44,24 @@ export interface HealthCheck {
   readonly availableMemoryMb: number;
   readonly coreCount: number;
   readonly reason?: string;
+  /** Snapshot of slot usage at check time */
+  readonly slots: Readonly<Record<string, { used: number; capacity: number }>>;
 }
+
+export const DEFAULT_RESOURCE_SLOTS: Readonly<Record<string, ResourceSlotConfig>> = {
+  /** Playwright, Puppeteer, or any headless browser instance */
+  browser: { capacity: 2 },
+  /** Vite, webpack-dev-server, or similar long-running dev processes */
+  devServer: { capacity: 2 },
+  /** TypeScript compilation, Rust builds, etc. */
+  build: { capacity: 3 },
+};
 
 export const DEFAULT_THRESHOLDS: ResourceThresholds = {
   maxLoadFactor: 0.80,      // Don't exceed 80% of cores
   maxMemoryUsage: 0.85,     // Leave 15% memory headroom
   checkIntervalMs: 5000,    // Check every 5s at most
+  resourceSlots: DEFAULT_RESOURCE_SLOTS,
 };
 
 export class ResourceMonitor {
@@ -41,9 +69,91 @@ export class ResourceMonitor {
   private lastCheck: HealthCheck | null = null;
   private lastCheckTime = 0;
 
+  /**
+   * In-memory slot holders. Key = slot name, value = set of holder IDs.
+   * Holder IDs are typically `${jobId}` or `${runId}-${slotName}`.
+   */
+  private readonly slotHolders = new Map<string, Set<string>>();
+
   constructor(thresholds?: Partial<ResourceThresholds>) {
     this.thresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
+
+    // Initialise holder sets for configured slots
+    for (const name of Object.keys(this.thresholds.resourceSlots)) {
+      this.slotHolders.set(name, new Set());
+    }
   }
+
+  // ─── Resource Slot API ────────────────────────────────────────────
+
+  /**
+   * Try to acquire a named resource slot. Returns true if acquired,
+   * false if the slot is at capacity.
+   *
+   * @param slot  Slot name (e.g. "browser", "devServer", "build")
+   * @param holder  Unique ID for the holder (job ID, run ID, etc.)
+   */
+  acquire(slot: string, holder: string): boolean {
+    const config = this.thresholds.resourceSlots[slot];
+    if (!config) return true; // Unknown slot — no limit
+
+    let holders = this.slotHolders.get(slot);
+    if (!holders) {
+      holders = new Set();
+      this.slotHolders.set(slot, holders);
+    }
+
+    if (holders.has(holder)) return true; // Already held — idempotent
+    if (holders.size >= config.capacity) return false;
+
+    holders.add(holder);
+    this.invalidateCache();
+    return true;
+  }
+
+  /**
+   * Release a previously acquired slot.
+   */
+  release(slot: string, holder: string): void {
+    const holders = this.slotHolders.get(slot);
+    if (holders?.delete(holder)) {
+      this.invalidateCache();
+    }
+  }
+
+  /**
+   * Release ALL slots held by a given holder (cleanup on job completion).
+   */
+  releaseAll(holder: string): void {
+    for (const holders of this.slotHolders.values()) {
+      holders.delete(holder);
+    }
+    this.invalidateCache();
+  }
+
+  /**
+   * Check if a slot has capacity available.
+   */
+  hasCapacity(slot: string): boolean {
+    const config = this.thresholds.resourceSlots[slot];
+    if (!config) return true;
+    const holders = this.slotHolders.get(slot);
+    return !holders || holders.size < config.capacity;
+  }
+
+  /**
+   * Snapshot of all slot usage.
+   */
+  slotSnapshot(): Readonly<Record<string, { used: number; capacity: number }>> {
+    const result: Record<string, { used: number; capacity: number }> = {};
+    for (const [name, config] of Object.entries(this.thresholds.resourceSlots)) {
+      const holders = this.slotHolders.get(name);
+      result[name] = { used: holders?.size ?? 0, capacity: config.capacity };
+    }
+    return result;
+  }
+
+  // ─── Health Check ─────────────────────────────────────────────────
 
   /**
    * Check system health. Returns a cached result if called within
@@ -65,6 +175,8 @@ export class ResourceMonitor {
     const memoryUsagePercent = usedMem / totalMem;
     const availableMemoryMb = Math.round(freeMem / (1024 * 1024));
 
+    const slots = this.slotSnapshot();
+
     let healthy = true;
     let reason: string | undefined;
 
@@ -79,6 +191,17 @@ export class ResourceMonitor {
       reason = reason ? `${reason}; ${memReason}` : memReason;
     }
 
+    // Check if any slot is at capacity — flag as unhealthy so the worker
+    // knows to inspect slots before blindly dispatching heavy jobs.
+    for (const [name, { used, capacity }] of Object.entries(slots)) {
+      if (used >= capacity) {
+        const slotReason = `Resource slot "${name}" full: ${used}/${capacity}`;
+        reason = reason ? `${reason}; ${slotReason}` : slotReason;
+        // Don't mark unhealthy — slot saturation is per-job-type, not system-wide.
+        // The worker uses hasCapacity() to decide per-job, not the global healthy flag.
+      }
+    }
+
     this.lastCheck = {
       healthy,
       cpuLoadFactor,
@@ -86,6 +209,7 @@ export class ResourceMonitor {
       availableMemoryMb,
       coreCount,
       reason,
+      slots,
     };
     this.lastCheckTime = now;
 
@@ -101,8 +225,7 @@ export class ResourceMonitor {
     let delay = 2000; // Start at 2s
 
     while (Date.now() - start < maxWaitMs) {
-      // Force a fresh check
-      this.lastCheckTime = 0;
+      this.invalidateCache();
       const health = this.check();
 
       if (health.healthy) return health;
@@ -113,7 +236,7 @@ export class ResourceMonitor {
     }
 
     // Timed out — return last check regardless
-    this.lastCheckTime = 0;
+    this.invalidateCache();
     return this.check();
   }
 
@@ -121,6 +244,13 @@ export class ResourceMonitor {
   summary(): string {
     const h = this.check();
     const status = h.healthy ? 'healthy' : 'stressed';
-    return `System ${status}: CPU ${(h.cpuLoadFactor * 100).toFixed(0)}%/${h.coreCount} cores | Memory ${(h.memoryUsagePercent * 100).toFixed(0)}% (${h.availableMemoryMb}MB free)`;
+    const slotParts = Object.entries(h.slots)
+      .map(([name, { used, capacity }]) => `${name}:${used}/${capacity}`)
+      .join(' ');
+    return `System ${status}: CPU ${(h.cpuLoadFactor * 100).toFixed(0)}%/${h.coreCount} cores | Memory ${(h.memoryUsagePercent * 100).toFixed(0)}% (${h.availableMemoryMb}MB free) | Slots: ${slotParts}`;
+  }
+
+  private invalidateCache(): void {
+    this.lastCheckTime = 0;
   }
 }
