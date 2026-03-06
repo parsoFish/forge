@@ -49,7 +49,8 @@ export type EventType =
   | 'review.complete'
   | 'review.scan'
   | 'pr-fix.complete'
-  | 'pr.merged';
+  | 'pr.merged'
+  | 'tuning.report';
 
 export interface ForgeEvent {
   readonly timestamp: string;

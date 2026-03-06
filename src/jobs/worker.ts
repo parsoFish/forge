@@ -110,6 +110,7 @@ export class Worker {
    */
   async start(keepAlive = false): Promise<void> {
     this.budget.resetRun();
+    this.resources.resetMetrics();
 
     // Recover any stuck jobs from a previous crash
     const recovered = this.queue.recoverStuck();
@@ -171,6 +172,7 @@ export class Worker {
         const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
         if (blocked) {
           this.queue.unclaim(job.id);
+          this.resources.recordBlock(blocked);
           console.log(chalk.dim(`  ⏳ ${job.type} for ${job.project ?? '?'} waiting on "${blocked}" slot`));
           break; // Don't try more jobs this tick — slots won't free until a job finishes
         }
@@ -226,6 +228,53 @@ export class Worker {
       type: 'worker.stop',
       summary: `Worker stopped. Processed: ${this._processedCount}. ${this.budget.summary()}`,
     });
+
+    // Tuning report — log metrics and suggest slot capacity changes
+    this.printTuningReport();
+  }
+
+  /**
+   * Analyse resource usage from this run and print tuning recommendations.
+   * Logs the full report as an event for future analysis. Only suggests
+   * changes — never auto-applies. Targets ~75% machine utilisation.
+   */
+  private printTuningReport(): void {
+    const report = this.resources.tuningReport();
+
+    // Always log the full report as an event (for trend analysis over time)
+    this.eventLog.emit({
+      type: 'tuning.report',
+      summary: `Peak CPU: ${(report.peakCpuLoadFactor * 100).toFixed(0)}% | Peak mem: ${(report.peakMemoryUsagePercent * 100).toFixed(0)}% | Healthy: ${report.healthySamples}/${report.totalSamples} samples`,
+      data: {
+        ...report,
+        slotMetrics: report.slotMetrics as unknown as Record<string, unknown>,
+        recommendations: report.recommendations as unknown as Record<string, unknown>[],
+      } as unknown as Record<string, unknown>,
+    });
+
+    // Print metrics summary
+    if (report.totalSamples > 0) {
+      console.log(chalk.bold.blue('\n── Resource Tuning Report ──'));
+      console.log(chalk.dim(`  Samples: ${report.totalSamples} | Healthy: ${report.healthySamples} (${(report.healthySamples / report.totalSamples * 100).toFixed(0)}%)`));
+      console.log(chalk.dim(`  Peak CPU: ${(report.peakCpuLoadFactor * 100).toFixed(0)}% | Peak memory: ${(report.peakMemoryUsagePercent * 100).toFixed(0)}%`));
+
+      for (const [name, metrics] of Object.entries(report.slotMetrics)) {
+        const utilPct = metrics.totalSamples > 0 ? (metrics.activeSamples / metrics.totalSamples * 100).toFixed(0) : '0';
+        console.log(chalk.dim(`  Slot "${name}": peak ${metrics.peakUsage}/${metrics.capacity} | active ${utilPct}% of time | ${metrics.blockCount} block(s)`));
+      }
+    }
+
+    // Print recommendations (interactive — user decides)
+    if (report.recommendations.length > 0) {
+      console.log(chalk.yellow('\n  Tuning suggestions (apply in forge.config.json → resourceThresholds.resourceSlots):'));
+      for (const rec of report.recommendations) {
+        const arrow = rec.suggestedCapacity > rec.currentCapacity ? '↑' : '↓';
+        console.log(chalk.yellow(`    ${arrow} "${rec.slot}": ${rec.currentCapacity} → ${rec.suggestedCapacity} — ${rec.reason}`));
+      }
+      console.log();
+    } else if (report.totalSamples > 0) {
+      console.log(chalk.green('  No tuning changes suggested — current config looks good.\n'));
+    }
   }
 
   /**
