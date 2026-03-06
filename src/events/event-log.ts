@@ -13,7 +13,7 @@
  * by what work was being done — without needing to open the file.
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync, createWriteStream, readdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, createWriteStream, readdirSync, unlinkSync, statSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WriteStream } from 'node:fs';
 
@@ -234,7 +234,6 @@ export class EventLog {
    * in the root logs directory. Returns the number of files removed.
    */
   pruneLogs(daysOld = 7): number {
-    const { unlinkSync, statSync } = require('node:fs') as typeof import('node:fs');
     const cutoff = Date.now() - daysOld * 24 * 60 * 60 * 1000;
     let pruned = 0;
 
@@ -245,12 +244,9 @@ export class EventLog {
       const fullPath = join(this.logsDir, file);
       try {
         const stat = statSync(fullPath);
-        if (stat.isFile() && file.endsWith('.jsonl')) {
-          // Legacy UUID log or old log — remove if older than cutoff
-          if (stat.mtimeMs < cutoff) {
-            unlinkSync(fullPath);
-            pruned++;
-          }
+        if (stat.isFile() && file.endsWith('.jsonl') && stat.mtimeMs < cutoff) {
+          unlinkSync(fullPath);
+          pruned++;
         }
       } catch { /* skip */ }
     }
@@ -271,11 +267,7 @@ export class EventLog {
       }
       // Remove empty project directories
       try {
-        const remaining = readdirSync(projectDir);
-        if (remaining.length === 0) {
-          const { rmdirSync } = require('node:fs') as typeof import('node:fs');
-          rmdirSync(projectDir);
-        }
+        if (readdirSync(projectDir).length === 0) rmdirSync(projectDir);
       } catch { /* skip */ }
     }
 

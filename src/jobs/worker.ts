@@ -20,6 +20,8 @@
  */
 
 import { resolve } from 'node:path';
+import { execSync } from 'node:child_process';
+import { mkdirSync, rmSync } from 'node:fs';
 import chalk from 'chalk';
 import { loadAgents, type AgentRole, type AgentDefinition } from '../agents/index.js';
 import { setGlobalEventLog, runAgent } from '../agents/runner.js';
@@ -359,7 +361,7 @@ export class Worker {
       const lastReviewedSha = job.metadata.lastReviewedSha as string | undefined;
       let currentRemoteSha = '';
       try {
-        const { execSync } = await import('node:child_process');
+
         currentRemoteSha = execSync(
           `gh api repos/${repo}/pulls/${prNumber} --jq .head.sha`,
           { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
@@ -378,7 +380,7 @@ export class Worker {
 
       // Also check if PR is still open — skip if already merged or closed
       try {
-        const { execSync } = await import('node:child_process');
+
         const state = execSync(
           `gh pr view ${prNumber} --repo ${repo} --json state --jq .state`,
           { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
@@ -492,9 +494,6 @@ export class Worker {
     let useWorktree = false;
 
     try {
-      const { execSync } = await import('node:child_process');
-      const { mkdirSync, rmSync } = await import('node:fs');
-
       // Clean up any stale worktree from a previous crash
       try { rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
       mkdirSync(resolve(this.settings.workspaceRoot, '.forge/worktrees'), { recursive: true });
@@ -574,8 +573,6 @@ Your final line MUST be one of:
     // Clean up worktree
     if (useWorktree) {
       try {
-        const { execSync } = await import('node:child_process');
-        const { rmSync } = await import('node:fs');
         execSync(`git worktree remove "${worktreeDir}" --force`, {
           cwd: projectPath,
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -595,7 +592,6 @@ Your final line MUST be one of:
     const lastReviewedSha = job.metadata.lastReviewedSha as string | undefined;
     let currentRemoteSha = '';
     try {
-      const { execSync } = await import('node:child_process');
       currentRemoteSha = execSync(
         `gh api repos/${repo}/pulls/${prNumber} --jq .head.sha`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
