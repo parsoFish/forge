@@ -1,0 +1,12 @@
+[submodule "trafficGame"]
+	path = trafficGame
+	url = https://github.com/parsoFish/trafficGame.git
+[submodule "simplarr"]
+	path = simplarr
+	url = https://github.com/parsoFish/simplarr.git
+[submodule "GitWeave"]
+	path = GitWeave
+	url = https://github.com/parsoFish/GitWeave.git
+[submodule "env-optimiser"]
+	path = env-optimiser
+	url = https://github.com/parsoFish/env-optimiser.git

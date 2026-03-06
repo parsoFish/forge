@@ -1,0 +1,25 @@
+{
+  "models": {
+    "architect": "claude-opus-4-6",
+    "planner": "claude-sonnet-4-6",
+    "testEngineer": "claude-sonnet-4-6",
+    "developer": "claude-sonnet-4-6",
+    "prCreator": "claude-haiku-4-5-20251001",
+    "reviewer": "claude-sonnet-4-6",
+    "prReviewer": "claude-sonnet-4-6",
+    "researcher": "claude-haiku-4-5-20251001",
+    "reflector": "claude-sonnet-4-6"
+  },
+  "budget": {
+    "maxRunBudgetUsd": 500,
+    "maxWeeklyBudgetUsd": 2000,
+    "warnAtPercent": 75
+  },
+  "maxConcurrency": 3,
+  "phaseConcurrency": {
+    "designPlan": 2,
+    "test": 2,
+    "develop": 2,
+    "prReview": 3
+  }
+}
