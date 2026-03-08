@@ -222,67 +222,14 @@ const commands: SlashCommand[] = [
       console.log(chalk.dim(`\n  Use /worker on or /worker off to toggle.\n`));
     },
   },
-  {
-    name: 'monitor',
-    aliases: ['mon'],
-    description: 'Toggle the live monitor panel on/off',
-    usage: '/monitor [on|off]',
-    handler: async (ctx, args) => {
-      const panel = ctx.session.monitorPanel;
-      if (!panel) {
-        console.log(chalk.dim('  Monitor panel not available (no worker).'));
-        return;
-      }
-
-      const sub = args[0]?.toLowerCase();
-      if (sub === 'on') {
-        panel.start();
-        console.log(chalk.green('  Monitor panel enabled.'));
-      } else if (sub === 'off') {
-        panel.stop();
-        console.log(chalk.yellow('  Monitor panel disabled.'));
-      } else {
-        // Toggle
-        panel.toggle();
-        console.log(chalk.dim(`  Monitor panel ${panel.isActive ? 'enabled' : 'disabled'}.`));
-      }
-    },
-  },
-  {
-    name: 'activity',
-    aliases: ['log'],
-    description: 'Show recent worker activity',
-    usage: '/activity [count]',
-    handler: async (ctx, args) => {
-      const count = parseInt(args[0], 10) || 30;
-      const messages = ctx.session.outputInterceptor.getRecent(count);
-
-      if (messages.length === 0) {
-        console.log(chalk.dim('\n  No recent activity.\n'));
-        return;
-      }
-
-      console.log(chalk.bold(`\n  Recent Activity (${messages.length} entries):\n`));
-      for (const msg of messages) {
-        const time = new Date(msg.time).toLocaleTimeString();
-        // Strip leading whitespace for display since the original
-        // messages already include indentation
-        const text = msg.text.replace(/^\s{0,4}/, '');
-        console.log(chalk.dim(`  ${time}  `) + text);
-      }
-      console.log();
-    },
-  },
+  // /monitor and /activity removed — replaced by dedicated tmux panes.
   {
     name: 'clear',
     aliases: ['cls'],
-    description: 'Clear the screen and redraw the status bar',
+    description: 'Clear the screen',
     usage: '/clear',
-    handler: async (ctx) => {
-      // Clear the entire screen
+    handler: async () => {
       process.stdout.write('\x1b[2J\x1b[1;1H');
-      // Redraw the status bar layout if active
-      ctx.session.monitorPanel?.redraw();
     },
   },
   {
@@ -297,7 +244,12 @@ const commands: SlashCommand[] = [
         const aliases = cmd.aliases.length > 0 ? chalk.dim(` (${cmd.aliases.map(a => '/' + a).join(', ')})`) : '';
         console.log(`  ${chalk.cyan(cmd.usage.padEnd(maxLen + 2))}${cmd.description}${aliases}`);
       }
-      console.log(chalk.dim('\n  Any other input is sent to the orchestrator agent chat.\n'));
+      console.log(chalk.bold('\n  Tmux Controls:\n'));
+      console.log(chalk.dim('  Ctrl+B then arrow   Switch between panes'));
+      console.log(chalk.dim('  Ctrl+B then D       Detach (forge keeps running)'));
+      console.log(chalk.dim('  Ctrl+B then Z       Zoom current pane (toggle)'));
+      console.log(chalk.dim('  /quit               Exit forge and close all panes'));
+      console.log();
     },
   },
   {

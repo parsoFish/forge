@@ -526,10 +526,11 @@ export class Orchestrator {
       ? [this.validateAndReturn(projectName)]
       : [...this.settings.projects];
 
-    // Cancel stale pr-fix jobs to prevent duplicate processing
-    const cancelled = this.queue.cancelByType('pr-fix', projectName ?? undefined);
-    if (cancelled > 0) {
-      console.log(chalk.dim(`  Cancelled ${cancelled} stale pr-fix job(s) from previous run.`));
+    // Cancel stale pr-fix and review jobs to prevent duplicate processing
+    const cancelledFixes = this.queue.cancelByType('pr-fix', projectName ?? undefined);
+    const cancelledReviews = this.queue.cancelByType('review', projectName ?? undefined);
+    if (cancelledFixes + cancelledReviews > 0) {
+      console.log(chalk.dim(`  Cancelled ${cancelledFixes + cancelledReviews} stale job(s) from previous run.`));
     }
 
     const prs = scanOpenPRs(projects, this.settings.workspaceRoot, this.settings.projectsDir);
@@ -539,22 +540,39 @@ export class Orchestrator {
       return;
     }
 
-    const jobs: { prNumber: number; project: string; title: string }[] = [];
+    // Chain consolidation: group PRs by chain tip.
+    // For chains, only queue a fix for the tip PR — it contains all ancestor
+    // commits, so fixing the tip fixes everything. Ancestors get closed after
+    // the tip merges. This avoids wasted effort fixing PRs that will conflict
+    // with each other.
+    const chainTips = new Map<number, typeof prs[0]>();   // tipPR# → tip PR
+    const chainAncestors = new Map<number, number[]>();    // tipPR# → ancestor PR#s
+    const standalone: typeof prs = [];
+
     for (const pr of prs) {
-      // Get HEAD SHA for each PR
-      let headSha = pr.uniqueHeadSha ?? '';
-      if (!headSha) {
-        try {
-          const projectPath = resolveProjectPath(this.settings, pr.project);
-          const json = execSync(
-            `gh pr view ${pr.number} --json headRefOid --jq .headRefOid`,
-            { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
-          ).trim();
-          headSha = json;
-        } catch {
-          headSha = '';
-        }
+      if (pr.chainTipPR && pr.chainTipPR !== pr.number) {
+        // This is an ancestor — group under its chain tip
+        const ancestors = chainAncestors.get(pr.chainTipPR) ?? [];
+        ancestors.push(pr.number);
+        chainAncestors.set(pr.chainTipPR, ancestors);
+      } else if (pr.chainMembers && pr.chainMembers.length > 1) {
+        // This IS the chain tip
+        chainTips.set(pr.number, pr);
+        const ancestors = chainAncestors.get(pr.number) ?? [];
+        chainAncestors.set(pr.number, ancestors);
+      } else {
+        standalone.push(pr);
       }
+    }
+
+    const jobs: { prNumber: number; project: string; title: string; isChainTip?: boolean }[] = [];
+
+    // Queue standalone PR fixes — prioritize by mergeLayer so base PRs
+    // get fixed and merged first, clearing the way for dependent PRs.
+    // Priority: 10 (base) → 11 → 12 → ... so lower layers run first.
+    for (const pr of standalone) {
+      const headSha = pr.uniqueHeadSha || this.getHeadSha(execSync, pr);
+      const layerPriority = 10 + Math.min(pr.mergeLayer, 5);
 
       this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, pr.project, {
         prNumber: pr.number,
@@ -564,21 +582,65 @@ export class Orchestrator {
         prTitle: pr.title,
         fixRound: 1,
         lastReviewedSha: headSha,
-      }, 12);
+        userTriaged: true,
+      }, layerPriority);
 
       jobs.push({ prNumber: pr.number, project: pr.project, title: pr.title });
     }
 
-    console.log(chalk.bold.blue(`\n▶ Fix-all: queued ${jobs.length} pr-fix job(s)`));
+    // Queue chain tip fixes (one per chain, consolidates all ancestors)
+    for (const [tipNum, tipPR] of chainTips) {
+      const ancestors = chainAncestors.get(tipNum) ?? [];
+      const headSha = tipPR.uniqueHeadSha || this.getHeadSha(execSync, tipPR);
+
+      this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, tipPR.project, {
+        prNumber: tipPR.number,
+        repo: tipPR.repo,
+        project: tipPR.project,
+        branch: tipPR.branch,
+        prTitle: tipPR.title,
+        fixRound: 1,
+        lastReviewedSha: headSha,
+        userTriaged: true,
+        isChainTip: true,
+        ancestorPRs: ancestors,
+        chainSize: ancestors.length + 1,
+      }, 12);
+
+      jobs.push({ prNumber: tipPR.number, project: tipPR.project, title: tipPR.title, isChainTip: true });
+
+      if (ancestors.length > 0) {
+        console.log(chalk.cyan(`  Chain: ${ancestors.length + 1} PRs → fixing tip #${tipNum} only (ancestors: ${ancestors.map(n => `#${n}`).join(', ')})`));
+      }
+    }
+
+    console.log(chalk.bold.blue(`\n▶ Fix-all: queued ${jobs.length} pr-fix job(s) (${chainTips.size} chain(s), ${standalone.length} standalone)`));
     for (const j of jobs) {
-      console.log(chalk.dim(`    [${j.project}] PR #${j.prNumber} — ${j.title}`));
+      const tag = j.isChainTip ? chalk.cyan(' [chain tip]') : '';
+      console.log(chalk.dim(`    [${j.project}] PR #${j.prNumber} — ${j.title}${tag}`));
     }
     this.printWorkerHint();
 
     this.eventLog.emit({
       type: 'jobs.queued',
-      summary: `Queued ${jobs.length} pr-fix jobs across ${projects.join(', ')}`,
+      summary: `Queued ${jobs.length} pr-fix jobs (${chainTips.size} chain(s), ${standalone.length} standalone) across ${projects.join(', ')}`,
     });
+  }
+
+  /** Helper to fetch HEAD SHA for a PR via gh CLI. */
+  private getHeadSha(
+    execSyncFn: typeof import('node:child_process').execSync,
+    pr: { number: number; project: string },
+  ): string {
+    try {
+      const projectPath = resolveProjectPath(this.settings, pr.project);
+      return execSyncFn(
+        `gh pr view ${pr.number} --json headRefOid --jq .headRefOid`,
+        { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      ).trim();
+    } catch {
+      return '';
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════

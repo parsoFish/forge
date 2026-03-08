@@ -1,31 +1,29 @@
 /**
- * Interactive session — the persistent forge experience.
+ * Interactive session — the main pane in the tmux forge UI.
  *
  * Architecture: The session owns three subsystems:
  * 1. **REPL** — readline-based prompt for slash commands
  * 2. **Worker** — background job executor (defaults to OFF)
- * 3. **OutputInterceptor** — prevents worker output from stomping user input
+ * 3. **OutputInterceptor** — silently discards background worker output
  *
- * The worker runs in the same process but its console output is intercepted
- * and written above the prompt line. The user's typing is never disrupted.
+ * The worker runs in the same process. Its console output is suppressed
+ * because status flows through .forge/worker-status.json to dedicated
+ * UI panes (queue, actions, monitor). The main pane stays clean.
  *
  * Worker lifecycle:
  * - Starts paused (off by default)
  * - User toggles with /worker on|off
  * - Auto-pauses on rate limit or budget exhaustion
  * - Auto-resumes after rate limit cooldown if user had it enabled
- *
- * This replaces the old approach where worker output freely interleaved
- * with the readline prompt, making it hard to type commands.
  */
 
 import * as readline from 'node:readline';
+import { execSync } from 'node:child_process';
 import chalk from 'chalk';
 import { Orchestrator } from '../orchestrator.js';
 import { Worker } from '../jobs/worker.js';
 import { setSessionMode } from '../agents/runner.js';
 import { OutputInterceptor } from './output.js';
-import { StatusBar } from './status-bar.js';
 import { dispatchCommand, type CommandContext } from './commands.js';
 
 /** How long to wait before auto-resuming after a rate limit (buffer on top of reset time). */
@@ -36,7 +34,6 @@ export class Session {
   private worker: Worker | null = null;
   private rl: readline.Interface | null = null;
   private readonly output = new OutputInterceptor();
-  private statusBar: StatusBar | null = null;
   private workerPromise: Promise<void> | null = null;
   private _shutdown = false;
 
@@ -64,9 +61,6 @@ export class Session {
     this.worker.pause();
     this.wireWorkerCallbacks();
 
-    // Create the status bar (starts when worker is enabled)
-    this.statusBar = new StatusBar(this.worker);
-
     // Start the worker loop in the background (it will sit paused)
     this.workerPromise = this.startWorkerBackground();
 
@@ -82,7 +76,6 @@ export class Session {
   enableWorker(): void {
     this._workerDesired = true;
     this.worker?.resume();
-    this.statusBar?.start();
     this.updatePrompt();
   }
 
@@ -91,7 +84,6 @@ export class Session {
     this._workerDesired = false;
     this.cancelResumeTimer();
     this.worker?.pause();
-    this.statusBar?.stop();
     this.updatePrompt();
   }
 
@@ -115,34 +107,19 @@ export class Session {
     return this.worker?.activeJobCount ?? 0;
   }
 
-  /** The output interceptor (for /activity command). */
-  get outputInterceptor(): OutputInterceptor {
-    return this.output;
-  }
-
-  /** The status bar (for /monitor toggle). */
-  get monitorPanel(): StatusBar | null {
-    return this.statusBar;
-  }
-
   /**
-   * Pause all background terminal manipulation so an interactive command
-   * (like PR triage) can use the readline directly without conflicts.
-   *
-   * Stops: OutputInterceptor, StatusBar refresh, prompt timer updates.
-   * The readline itself stays open — interactive commands use question().
+   * Pause output suppression so an interactive command (like PR triage)
+   * can use the readline directly without conflicts.
    */
   pauseForInteraction(): void {
-    this.output.stop();
-    this.statusBar?.stop();
+    this.output.unsuppress();
   }
 
   /**
-   * Resume background terminal manipulation after interactive command completes.
+   * Resume background output suppression after interactive command completes.
    */
   resumeAfterInteraction(): void {
-    if (this.rl) this.output.start(this.rl);
-    if (this._workerDesired) this.statusBar?.start();
+    this.output.suppress();
   }
 
   /**
@@ -165,7 +142,7 @@ export class Session {
 
   private printBanner(): void {
     console.log(chalk.bold.blue('\n╔══════════════════════════════════════════╗'));
-    console.log(chalk.bold.blue('║') + chalk.bold('         Forge Orchestrator v0.4.0        ') + chalk.bold.blue('║'));
+    console.log(chalk.bold.blue('║') + chalk.bold('         Forge Orchestrator v0.5.0        ') + chalk.bold.blue('║'));
     console.log(chalk.bold.blue('╚══════════════════════════════════════════╝'));
     console.log();
     console.log(chalk.dim('  Type /help for commands, /quit to exit.'));
@@ -195,10 +172,9 @@ export class Session {
       return chalk.blue('forge') + chalk.yellow(` [⏳ ${time}]`) + chalk.blue('> ');
     }
 
-    // Use the status bar's enriched status (running/queued/slots/budget)
-    if (this.statusBar) {
-      const status = this.statusBar.buildPromptStatus();
-      return chalk.blue('forge') + ' [' + status + ']' + chalk.blue('> ');
+    const active = this.worker?.activeJobCount ?? 0;
+    if (active > 0) {
+      return chalk.blue('forge') + chalk.green(` [${active} running]`) + chalk.blue('> ');
     }
 
     return chalk.blue('forge') + chalk.green(' [idle]') + chalk.blue('> ');
@@ -233,7 +209,7 @@ export class Session {
       this.updatePrompt();
 
       const resumeTime = new Date(resetAt).toLocaleTimeString();
-      console.log(chalk.yellow(`  ⏸ Worker auto-paused (rate limited until ${resumeTime})`));
+      this.output.writeDirect(chalk.yellow(`  ⏸ Worker auto-paused (rate limited until ${resumeTime})`));
 
       // If the user had the worker enabled, schedule auto-resume
       if (this._workerDesired) {
@@ -246,8 +222,8 @@ export class Session {
       this.worker?.pause();
       this.cancelResumeTimer();
       this.updatePrompt();
-      console.log(chalk.red('  ⏸ Worker disabled — budget exhausted.'));
-      console.log(chalk.dim('     Use /worker on after adjusting budget to resume.'));
+      this.output.writeDirect(chalk.red('  ⏸ Worker disabled — budget exhausted.'));
+      this.output.writeDirect(chalk.dim('     Use /worker on after adjusting budget to resume.'));
     };
   }
 
@@ -259,7 +235,7 @@ export class Session {
 
     const delayMs = Math.max(0, resetAt - Date.now()) + RESUME_BUFFER_MS;
     const resumeTime = new Date(resetAt + RESUME_BUFFER_MS).toLocaleTimeString();
-    console.log(chalk.dim(`  Auto-resume scheduled for ${resumeTime}`));
+    this.output.writeDirect(chalk.dim(`  Auto-resume scheduled for ${resumeTime}`));
 
     this._resumeTimer = setTimeout(() => {
       this._resumeTimer = null;
@@ -267,7 +243,7 @@ export class Session {
 
       if (!this._workerDesired || this._shutdown) return;
 
-      console.log(chalk.green('  ▶ Auto-resuming worker after rate limit cooldown'));
+      this.output.writeDirect(chalk.green('  ▶ Auto-resuming worker after rate limit cooldown'));
       this.worker?.resume();
       this.updatePrompt();
     }, delayMs);
@@ -289,7 +265,7 @@ export class Session {
     } catch (error) {
       if (!this._shutdown) {
         const msg = error instanceof Error ? error.message : String(error);
-        console.log(chalk.red(`\n  Worker error: ${msg}`));
+        this.output.writeDirect(chalk.red(`\n  Worker error: ${msg}`));
       }
     }
   }
@@ -306,8 +282,8 @@ export class Session {
       terminal: process.stdin.isTTY ?? false,
     });
 
-    // Start intercepting console output AFTER readline is created
-    this.output.start(this.rl);
+    // Suppress background worker output — info panes handle visibility
+    this.output.start();
 
     // Periodically update the prompt to reflect worker state changes
     const promptTimer = setInterval(() => this.updatePrompt(), 3_000);
@@ -337,17 +313,23 @@ export class Session {
         return;
       }
 
-      // Try slash command dispatch
-      if (input.startsWith('/')) {
-        await dispatchCommand(input, ctx);
-        this.rl?.prompt();
-        return;
-      }
+      // Unsuppress console for user-initiated output, then re-suppress
+      this.output.unsuppress();
+      try {
+        // Try slash command dispatch
+        if (input.startsWith('/')) {
+          await dispatchCommand(input, ctx);
+          this.rl?.prompt();
+          return;
+        }
 
-      // Non-slash input — for now, hint about commands
-      console.log(chalk.dim('  Use /help to see available commands.'));
-      console.log(chalk.dim('  (Orchestrator chat coming in a future update)'));
-      this.rl?.prompt();
+        // Non-slash input — for now, hint about commands
+        console.log(chalk.dim('  Use /help to see available commands.'));
+        console.log(chalk.dim('  (Orchestrator chat coming in a future update)'));
+        this.rl?.prompt();
+      } finally {
+        this.output.suppress();
+      }
     });
 
     this.rl.on('close', async () => {
@@ -376,8 +358,6 @@ export class Session {
 
     console.log(chalk.yellow('\n  Shutting down forge...'));
 
-    // Stop the status bar and output interceptor
-    this.statusBar?.stop();
     this.output.stop();
 
     // Reset session mode
@@ -402,6 +382,15 @@ export class Session {
         ]);
       } catch { /* worker may have already stopped */ }
     }
+
+    // If running inside a forge tmux session, kill the whole session
+    // so all panes (queue, actions, monitor) close together.
+    try {
+      const tmuxSession = process.env.TMUX;
+      if (tmuxSession) {
+        execSync('tmux kill-session -t forge 2>/dev/null', { stdio: 'pipe' });
+      }
+    } catch { /* not in tmux or session already gone */ }
 
     console.log(chalk.dim('  Goodbye.\n'));
     process.exit(0);

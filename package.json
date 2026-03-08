@@ -1,6 +1,6 @@
 {
   "name": "forge-orchestrator",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "Autonomous multi-agent orchestrator — a lead engineer for your codebase",
   "type": "module",
   "bin": {

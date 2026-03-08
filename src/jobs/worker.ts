@@ -30,6 +30,8 @@ import { StateStore } from '../state/index.js';
 import { EventLog } from '../events/index.js';
 import { BudgetTracker } from '../budget/index.js';
 import { ResourceMonitor } from '../monitor/index.js';
+import { AdaptiveConcurrency } from '../monitor/adaptive-concurrency.js';
+import { ResourceProfiler, type ResourceObservation } from '../monitor/resource-profiler.js';
 import { JobQueue } from './queue.js';
 import type { Job, JobPhase } from './types.js';
 import { runRoadmapStage } from '../workflow/stages/roadmap.js';
@@ -41,6 +43,7 @@ import { markForReview } from '../workflow/stages/review.js';
 import { runReflectionStage } from '../workflow/stages/reflect.js';
 import { scanOpenPRs, runPRReviewStage } from '../workflow/stages/review-prs.js';
 import { STAGE_AGENT_MAP, type WorkItem } from '../workflow/types.js';
+import { writeWorkerStatus, clearWorkerStatus, type WorkerStatus } from '../ui/worker-status-file.js';
 
 const POLL_INTERVAL_MS = 3_000;  // Check for new jobs every 3s
 const IDLE_LOG_INTERVAL_MS = 60_000;  // Log "still waiting" every 60s when idle
@@ -77,6 +80,8 @@ export class Worker {
   private readonly eventLog: EventLog;
   private readonly budget: BudgetTracker;
   private readonly resources: ResourceMonitor;
+  private readonly adaptive: AdaptiveConcurrency;
+  private readonly profiler: ResourceProfiler;
   private readonly agents: Map<AgentRole, AgentDefinition>;
   private readonly queue: JobQueue;
 
@@ -93,6 +98,8 @@ export class Worker {
   private _lastSlotBlockLogged: string | null = null;
   /** Promises for all in-flight jobs — tracked so we can await them on shutdown. */
   private readonly _inflightJobs = new Set<Promise<void>>();
+  /** Projects with an active pr-fix job — serialize fixes per project to avoid conflict whack-a-mole. */
+  private readonly _projectFixLocks = new Set<string>();
 
   // ── Session integration callbacks ──────────────────────────────
 
@@ -117,6 +124,10 @@ export class Worker {
     this.eventLog = new EventLog(forgeRoot);
     this.budget = new BudgetTracker(forgeRoot, this.settings.budget);
     this.resources = new ResourceMonitor(this.settings.resourceThresholds);
+    this.profiler = new ResourceProfiler(forgeRoot);
+    this.adaptive = new AdaptiveConcurrency(this.resources, this.profiler, {
+      ceiling: this.settings.maxConcurrency > 0 ? this.settings.maxConcurrency : undefined,
+    });
     this.agents = loadAgents(this.settings);
     this.queue = new JobQueue(forgeRoot);
 
@@ -186,6 +197,48 @@ export class Worker {
     return this.budget;
   }
 
+  /** Write current status to .forge/worker-status.json for UI panes. */
+  private broadcastStatus(): void {
+    const health = this.resources.check();
+    const queueSummary = this.queue.summary();
+    const status: WorkerStatus = {
+      pid: process.pid,
+      state: this._rateLimitResetAt > Date.now()
+        ? 'rate-limited'
+        : this._paused ? 'paused' : 'running',
+      updatedAt: new Date().toISOString(),
+      activeJobs: this._activeJobs,
+      processedCount: this._processedCount,
+      rateLimitResetAt: this._rateLimitResetAt > 0 ? this._rateLimitResetAt : undefined,
+      queue: {
+        queued: queueSummary.queued,
+        running: queueSummary.running,
+        completed: queueSummary.completed,
+        failed: queueSummary.failed,
+      },
+      resources: {
+        healthy: health.healthy,
+        cpuLoadFactor: health.cpuLoadFactor,
+        memoryUsagePercent: health.memoryUsagePercent,
+        availableMemoryMb: health.availableMemoryMb,
+        reason: health.reason,
+        slots: health.slots,
+      },
+      budget: {
+        runCostUsd: this.budget.runCost,
+        weekCostUsd: this.budget.weekCost,
+        summary: this.budget.summary(),
+      },
+      concurrency: {
+        current: this._activeJobs,
+        target: this.adaptive.currentTarget,
+        ceiling: this.adaptive.maxCeiling,
+        smoothedCpuLoad: this.adaptive.currentSmoothedCpu,
+      },
+    };
+    writeWorkerStatus(resolve(this.settings.workspaceRoot, '.forge'), status);
+  }
+
   /**
    * Start the worker loop. Runs until:
    * - All jobs are processed and no more are queued
@@ -229,13 +282,14 @@ export class Worker {
       console.log(chalk.dim(`  Pruned ${parts.join(', ')}.`));
     }
 
-    const maxConcurrency = this.settings.maxConcurrency;
     let bannerPrinted = false;
     let lastIdleLog = 0;
 
     while (!this._shutdownRequested) {
-      // Pause gate — sleep while paused, but keep the loop alive
+      // Pause gate — sleep while paused, but keep the loop alive.
+      // Still broadcast status so monitoring pane shows current state.
       if (this._paused) {
+        try { this.broadcastStatus(); } catch { /* best-effort */ }
         await this.sleep(POLL_INTERVAL_MS);
         continue;
       }
@@ -244,22 +298,13 @@ export class Worker {
       if (!bannerPrinted) {
         bannerPrinted = true;
         console.log(chalk.bold.green('\n  ▶ Worker enabled'));
-        console.log(chalk.dim(`    Budget: ${this.budget.summary()}`));
         console.log(chalk.dim(`    Queue: ${this.queue.summaryString()}`));
-        console.log(chalk.dim(`    Concurrency: ${maxConcurrency} parallel jobs`));
+        console.log(chalk.dim(`    Adaptive concurrency: target ${this.adaptive.currentTarget}, ceiling ${this.adaptive.maxCeiling}`));
         console.log();
         this.eventLog.emit({
           type: 'worker.start',
-          summary: `Worker started (concurrency=${maxConcurrency}). Queue: ${this.queue.summaryString()}`,
+          summary: `Worker started (adaptive, ceiling=${this.adaptive.maxCeiling}). Queue: ${this.queue.summaryString()}`,
         });
-      }
-
-      // Budget gate
-      if (!this.budget.canAfford()) {
-        console.log(chalk.red(`\n  ⛔ Budget exhausted. ${this.budget.summary()}`));
-        console.log(chalk.dim('     Start a new worker session to continue.\n'));
-        this.onBudgetExhausted?.();
-        break;
       }
 
       // Rate limit gate — notify the session and pause instead of sleeping inline.
@@ -279,24 +324,37 @@ export class Worker {
         // Standalone worker mode: sleep inline
         await this.sleep(Math.min(waitMs + 2000, 600_000)); // +2s buffer, cap 10min
         this._rateLimitResetAt = 0;
-        continue; // Re-check budget/health before claiming
+        continue; // Re-check health before claiming
       }
 
-      // Resource gate
-      const health = this.resources.check();
-      if (!health.healthy) {
-        console.log(chalk.yellow(`  ⏳ System stressed (${health.reason}) — waiting...`));
-        await this.resources.waitForHealth();
+      // Adaptive concurrency — evaluate how many agents the system can handle
+      // based on CPU load, memory, and learned resource profiles.
+      const pendingJobs = this.queue.queued().slice(0, 5).map(j => ({
+        type: j.type, project: j.project ?? undefined,
+      }));
+      const concurrency = this.adaptive.evaluate(this._activeJobs, pendingJobs);
+
+      // If throttled (critical pressure), wait for the system to recover
+      if (concurrency.throttled && this._activeJobs > 0) {
+        console.log(chalk.yellow(`  ⏳ ${concurrency.reason} — waiting for running agents to finish...`));
+        await this.sleep(POLL_INTERVAL_MS * 2);
+        continue;
       }
 
-      // Fill available concurrency slots
+      // Fill available concurrency slots (up to adaptive target)
       let claimedAny = false;
-      while (this._activeJobs < maxConcurrency && !this._shutdownRequested) {
+      while (this._activeJobs < concurrency.target && !this._shutdownRequested) {
         // Pre-check: peek at the next queued job's type and verify slot
         // availability BEFORE claiming. This avoids the expensive
         // claim→unclaim disk I/O cycle when slots are known-full.
         const peeked = this.queue.queued()[0];
         if (!peeked) break;  // No more queued jobs
+
+        // Per-project serialization for pr-fix jobs: only one fix at a time
+        // per project to prevent parallel fixes from creating new conflicts.
+        if (peeked.type === 'pr-fix' && peeked.project && this._projectFixLocks.has(peeked.project)) {
+          break; // Wait for current fix to finish before starting next
+        }
 
         const requiredSlots = JOB_RESOURCE_SLOTS[peeked.type] ?? [];
         const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
@@ -337,7 +395,7 @@ export class Worker {
         if (!keepAlive) {
           if (this._processedCount > 0) {
             console.log(chalk.bold.green(`\n✓ All jobs processed (${this._processedCount} total)`));
-            console.log(chalk.dim(`  ${this.budget.summary()}\n`));
+            console.log(chalk.dim(`  Cost: ${this.budget.summary()}\n`));
           } else {
             console.log(chalk.dim('  No jobs in queue. Nothing to do.\n'));
           }
@@ -375,6 +433,10 @@ export class Worker {
       this._lastTickProcessed = this._processedCount;
       this._noProgressTicks = 0;
 
+      // Broadcast status for UI panes and flush resource profiles before sleeping
+      try { this.broadcastStatus(); } catch { /* best-effort */ }
+      try { this.profiler.flush(); } catch { /* best-effort */ }
+
       // Poll interval — check for new jobs or finished slots
       await this.sleep(POLL_INTERVAL_MS);
     }
@@ -384,6 +446,9 @@ export class Worker {
       console.log(chalk.dim(`  Waiting for ${this._inflightJobs.size} in-flight job(s) to finish...`));
       await Promise.allSettled([...this._inflightJobs]);
     }
+
+    // Clear status file so UI panes know the worker is off
+    clearWorkerStatus(resolve(this.settings.workspaceRoot, '.forge'));
 
     this.eventLog.emit({
       type: 'worker.stop',
@@ -452,10 +517,18 @@ export class Worker {
    * This runs as a detached promise — the main loop doesn't await it.
    */
   private async runJobAndTrack(job: Job): Promise<void> {
+    // Acquire per-project fix lock
+    if (job.type === 'pr-fix' && job.project) {
+      this._projectFixLocks.add(job.project);
+    }
     try {
       await this.executeJob(job);
     } finally {
       this._processedCount++;
+      // Release per-project fix lock
+      if (job.type === 'pr-fix' && job.project) {
+        this._projectFixLocks.delete(job.project);
+      }
     }
   }
 
@@ -466,6 +539,11 @@ export class Worker {
   private async executeJob(job: Job): Promise<void> {
     this._activeJobs++;
     const startTime = Date.now();
+
+    // Snapshot baseline metrics before the job starts — used to calculate
+    // the resource delta for the profiler after the job completes.
+    const baselineHealth = this.resources.check();
+    let jobSuccess = false;
 
     this.eventLog.emit({
       type: 'job.start',
@@ -500,6 +578,7 @@ export class Worker {
           throw new Error(`Unknown job type: ${job.type}`);
       }
 
+      jobSuccess = true;
       this.queue.complete(job.id);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -507,6 +586,10 @@ export class Worker {
         type: 'job.complete',
         project: job.project ?? undefined,
         summary: `Job complete: ${job.type}${job.project ? ` for ${job.project}` : ''} (${elapsed}s)`,
+        data: {
+          durationMs: Date.now() - startTime,
+          jobType: job.type,
+        },
       });
     } catch (error) {
       // Deferred jobs go back in the queue — not completed, not failed
@@ -543,6 +626,22 @@ export class Worker {
       this._activeJobs--;
       // Release any resource slots held by this job
       this.resources.releaseAll(job.id);
+
+      // Record resource observation for the profiler — builds per-project
+      // resource usage knowledge over time for smarter scheduling.
+      const endHealth = this.resources.check();
+      const durationMs = Date.now() - startTime;
+      const observation: ResourceObservation = {
+        jobType: job.type,
+        project: job.project ?? undefined,
+        cpuLoadFactor: Math.max(0, endHealth.cpuLoadFactor - baselineHealth.cpuLoadFactor + 0.05),
+        peakMemoryPercent: endHealth.memoryUsagePercent,
+        memoryDeltaMb: Math.max(0, baselineHealth.availableMemoryMb - endHealth.availableMemoryMb),
+        durationMs,
+        success: jobSuccess,
+        recordedAt: new Date().toISOString(),
+      };
+      try { this.profiler.record(observation); } catch { /* best-effort */ }
     }
   }
 
@@ -1044,59 +1143,69 @@ The goal is to get this branch into a mergeable, approved state that lands every
 - Project: ${project}
 - Fix round: ${fixRound}
 ${userFeedbackBlock}${chainBlock}
-## Your Task
+## Local-First Fix Workflow
 
-1. Check for merge conflicts or branch issues FIRST:
-   \`\`\`bash
-   git fetch origin main
-   git merge origin/main --no-edit 2>&1 || echo "MERGE_CONFLICT"
-   \`\`\`
-   If there are merge conflicts, resolve them. You wrote this code — use the
-   project's CLAUDE.md, core values, and test suite to decide the right resolution.
-   After resolving: \`git add <resolved files> && git commit -m "fix: resolve merge conflicts with main"\`
+All work happens locally in your worktree. Fix everything, verify it passes,
+then push once at the end. Never push partial or broken state.
 
-2. Check CI status and inspect any failures:
+### Step 1: Sync with main
+\`\`\`bash
+git fetch origin main
+git merge origin/main --no-edit 2>&1 || echo "MERGE_CONFLICT"
+\`\`\`
+If merge conflicts exist, resolve them. You wrote this code — use the project's
+CLAUDE.md, core values, and test suite to decide the right resolution.
+After resolving: \`git add <resolved files> && git commit -m "fix: resolve merge conflicts with main"\`
+
+### Step 2: Gather all feedback
+Collect everything that needs fixing before making any changes:
+
+a) **CI failures** — often the real blocker:
    \`\`\`bash
    gh pr checks ${prNumber} --repo ${repo} 2>&1
-   \`\`\`
-   If any checks failed, get the failure logs:
-   \`\`\`bash
-   # Get the failed run ID from the checks output, then:
-   gh run view <run-id> --repo ${repo} --log-failed 2>&1 | tail -50
-   \`\`\`
-   CI failures are often the real blocker. Fix these alongside reviewer feedback.
-
-3. Read the latest review comments on this PR:
-   \`gh api repos/${repo}/issues/${prNumber}/comments --jq '.[-3:] | .[] | {user: .user.login, body: .body[:500]}'\`
-
-4. Understand what was flagged — both from reviewer comments AND CI failures.
-
-5. Fix what's needed. If CI is failing due to missing CI config (e.g. missing
-   tool installation in workflow), fix the workflow file. If tests fail, fix
-   the code. Do not refactor or add features beyond what's needed.
-
-6. Run the project's test suite locally to verify nothing breaks.
-
-7. Commit and push:
-   \`\`\`bash
-   git add <changed files>
-   git commit -m "fix: address reviewer feedback on PR #${prNumber}
-
-   - <specific fix 1>
-   - <specific fix 2>
-
-   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
-   git push origin ${branch}
+   # If any checks failed, get failure logs:
+   # gh run view <run-id> --repo ${repo} --log-failed 2>&1 | tail -80
    \`\`\`
 
-8. VERIFY the push landed (MANDATORY):
-   \`\`\`bash
-   LOCAL_SHA=$(git rev-parse HEAD)
-   REMOTE_SHA=$(gh api repos/${repo}/pulls/${prNumber} --jq .head.sha)
-   echo "Local:  $LOCAL_SHA"
-   echo "Remote: $REMOTE_SHA"
-   \`\`\`
-   If they don't match, retry the push once more.
+b) **Review comments**:
+   \`gh api repos/${repo}/issues/${prNumber}/comments --jq '.[-5:] | .[] | {user: .user.login, body: .body[:500]}'\`
+
+c) **PR review threads** (inline comments):
+   \`gh api repos/${repo}/pulls/${prNumber}/comments --jq '.[-5:] | .[] | {user: .user.login, path: .path, body: .body[:500]}'\`
+
+### Step 3: Fix everything locally
+- Address ALL identified issues: CI failures, review comments, merge conflicts.
+- If CI fails due to missing tooling in workflow config, fix the workflow file.
+- If tests fail, fix the code (not the tests, unless tests are wrong).
+- Do not refactor or add features beyond what's needed to resolve feedback.
+
+### Step 4: Verify locally before pushing
+Run the project's full test suite and linter. Do NOT push until tests pass:
+\`\`\`bash
+# Discover and run the project's test/lint commands from package.json, Makefile, etc.
+\`\`\`
+If tests fail after your fixes, debug and fix again. Do not push broken code.
+
+### Step 5: Push once, clean
+\`\`\`bash
+git add <changed files>
+git commit -m "fix: address review feedback on PR #${prNumber}
+
+- <specific fix 1>
+- <specific fix 2>
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+git push origin ${branch}
+\`\`\`
+
+### Step 6: Verify push landed (MANDATORY)
+\`\`\`bash
+LOCAL_SHA=$(git rev-parse HEAD)
+REMOTE_SHA=$(gh api repos/${repo}/pulls/${prNumber} --jq .head.sha)
+echo "Local:  $LOCAL_SHA"
+echo "Remote: $REMOTE_SHA"
+\`\`\`
+If they don't match, retry the push once more.
 
 ## Output
 
@@ -1384,20 +1493,35 @@ Your final line MUST be one of:
       });
     }
 
-    // 2. Auto-merge self-authored PRs that are ready
+    // 2. Auto-merge self-authored PRs that are ready.
+    //
+    // Merge in order: lowest mergeLayer first (base PRs before tips).
+    // After each merge, requeue fix jobs for remaining PRs in that project
+    // since the merge changes the base and may resolve or create conflicts.
     const openPRs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot, this.settings.projectsDir);
+    const mergeOrder = [...openPRs].sort((a, b) => (a.mergeLayer ?? 0) - (b.mergeLayer ?? 0));
     let autoMerged = 0;
-    for (const pr of openPRs) {
+    const mergedProjects = new Set<string>();
+
+    for (const pr of mergeOrder) {
       try {
         const isMergeable = await this.isSelfAuthoredAndMergeable(pr.number, pr.repo);
-        if (isMergeable && pr.dependsOnPRs.length === 0) {
-          execSync(
-            `gh pr merge ${pr.number} --repo ${pr.repo} --squash --delete-branch`,
-            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
-          );
-          console.log(chalk.green(`  ✓ Heartbeat: auto-merged PR #${pr.number} (${pr.project})`));
-          autoMerged++;
-        }
+        if (!isMergeable) continue;
+
+        // Only require no *unmerged* dependencies — a dependency that was
+        // just merged in this heartbeat cycle should not block us.
+        const hasBlockingDeps = pr.dependsOnPRs.some((depPR) =>
+          openPRs.some((op) => op.number === depPR && !mergedProjects.has(`${op.repo}#${op.number}`)),
+        );
+        if (hasBlockingDeps) continue;
+
+        execSync(
+          `gh pr merge ${pr.number} --repo ${pr.repo} --squash --delete-branch`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        console.log(chalk.green(`  ✓ Heartbeat: auto-merged PR #${pr.number} (${pr.project})`));
+        mergedProjects.add(`${pr.repo}#${pr.number}`);
+        autoMerged++;
       } catch { /* merge failed — will retry next heartbeat */ }
     }
     if (autoMerged > 0) {
@@ -1405,6 +1529,48 @@ Your final line MUST be one of:
         type: 'heartbeat.merge',
         summary: `Auto-merged ${autoMerged} self-authored PR(s)`,
       });
+
+      // Cascade: requeue fix jobs for remaining open PRs in merged projects.
+      // Merging changes the base branch — remaining PRs likely need conflict
+      // resolution or at minimum a re-review to verify they're still clean.
+      const remainingPRs = openPRs.filter(
+        (pr) => !mergedProjects.has(`${pr.repo}#${pr.number}`),
+      );
+      const projectsToRefix = new Set(
+        [...mergedProjects].map((key) => {
+          const match = openPRs.find((p) => `${p.repo}#${p.number}` === key);
+          return match?.project;
+        }).filter(Boolean) as string[],
+      );
+
+      let cascadeQueued = 0;
+      for (const pr of remainingPRs) {
+        if (!projectsToRefix.has(pr.project)) continue;
+
+        // Don't double-queue if a fix or review job already exists for this PR
+        const existing = this.queue.all().find(
+          (j) => (j.type === 'pr-fix' || j.type === 'review')
+            && j.metadata.prNumber === pr.number
+            && (j.status === 'queued' || j.status === 'running'),
+        );
+        if (existing) continue;
+
+        this.queue.post('pr-fix', 'review' as JobPhase, pr.project, {
+          prNumber: pr.number,
+          branch: pr.branch,
+          repo: pr.repo,
+          fixRound: 1,
+          userTriaged: true,
+        }, 12);
+        cascadeQueued++;
+      }
+      if (cascadeQueued > 0) {
+        console.log(chalk.blue(`  ♻ Heartbeat: queued ${cascadeQueued} cascade fix(es) after merge`));
+        this.eventLog.emit({
+          type: 'heartbeat.queue',
+          summary: `Cascade: queued ${cascadeQueued} fix job(s) for PRs in projects where a PR just merged`,
+        });
+      }
     }
 
     // 3. Retry failed work items (max 2 retries tracked via blockReason)
@@ -1470,6 +1636,50 @@ Your final line MUST be one of:
         type: 'heartbeat.queue',
         summary: `Queued ${queuedCount} unblocked work item(s)`,
       });
+    }
+
+    // 5. Clean up local branches for merged/closed PRs.
+    //    Remote branches are handled by --delete-branch on merge/close.
+    //    Local branches accumulate silently, creating clutter and confusion.
+    this.pruneLocalBranches();
+  }
+
+  /**
+   * Delete local branches whose remote tracking branch no longer exists.
+   * These are branches from merged or closed PRs where --delete-branch
+   * already removed the remote ref.
+   */
+  private pruneLocalBranches(): void {
+    for (const project of this.settings.projects) {
+      const projectPath = resolveProjectPath(this.settings, project);
+      try {
+        // Fetch and prune remote tracking refs
+        execSync('git fetch --prune', {
+          cwd: projectPath,
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        // Find local branches with a gone remote
+        const branches = execSync(
+          "git branch -vv | grep ': gone]' | awk '{print $1}'",
+          { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        ).trim();
+
+        if (!branches) continue;
+
+        for (const branch of branches.split('\n').filter(Boolean)) {
+          // Never delete the default branch
+          if (branch === 'main' || branch === 'master') continue;
+          try {
+            execSync(`git branch -D "${branch}"`, {
+              cwd: projectPath,
+              encoding: 'utf-8',
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+          } catch { /* branch might be checked out — skip */ }
+        }
+      } catch { /* git errors in this project — skip */ }
     }
   }
 

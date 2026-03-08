@@ -3,3 +3,5 @@ dist/
 .forge/
 *.tsbuildinfo
 .claude/
+projects/
+ui-scratch.png

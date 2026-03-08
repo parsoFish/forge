@@ -18,10 +18,10 @@
   },
   "maxConcurrency": 4,
   "phaseConcurrency": {
-    "designPlan": 2,
+    "designPlan": 4,
     "test": 2,
     "develop": 3,
-    "prReview": 2
+    "prReview": 4
   },
   "resourceThresholds": {
     "minAvailableMemoryMb": 2000,

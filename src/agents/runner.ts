@@ -448,6 +448,13 @@ export class AgentRun extends EventEmitter {
               if (block.type === 'text' && block.text) {
                 this.emit('text', { text: block.text });
                 globalEventLog?.writeRunLog(this.runId, { type: 'text', text: block.text.slice(0, 500) });
+                // Emit to global event log so the actions pane shows live output excerpts
+                globalEventLog?.emit({
+                  type: 'agent.output',
+                  agentRole: this.agentRole,
+                  runId: this.runId,
+                  summary: block.text.slice(0, 120),
+                });
               }
               if (block.type === 'tool_use' && block.name) {
                 const toolData = {

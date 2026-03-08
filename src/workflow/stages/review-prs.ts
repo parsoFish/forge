@@ -74,13 +74,20 @@ export interface OpenPR {
  */
 function buildMergeOrder(prs: OpenPR[], cwd: string): OpenPR[] {
   // Fetch commits per branch (newest first, SHAs only)
-  const commitsBySHA = new Map<number, string[]>(); // pr# → commit SHAs (not in master)
+  // Detect default branch dynamically (main, master, etc.)
+  let defaultBranch = 'main';
+  try {
+    const ref = execSync('git symbolic-ref refs/remotes/origin/HEAD', { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    defaultBranch = ref.replace('refs/remotes/origin/', '');
+  } catch { /* fallback to main */ }
+
+  const commitsBySHA = new Map<number, string[]>(); // pr# → commit SHAs (not in default branch)
   const headBySHA    = new Map<number, string>();    // pr# → tip/head SHA
 
   for (const pr of prs) {
     try {
       const raw = execSync(
-        `git log --pretty=format:%H master..origin/${pr.branch}`,
+        `git log --pretty=format:%H ${defaultBranch}..origin/${pr.branch}`,
         { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       ).trim();
       const commits = raw ? raw.split('\n') : [];

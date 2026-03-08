@@ -1,115 +1,62 @@
 /**
- * Output interceptor — prevents background worker output from stomping
- * on the interactive readline prompt.
+ * Output interceptor — suppresses background worker console output
+ * so the interactive session pane stays clean.
  *
- * WHY: The worker, agents, and LiveTracker all use console.log directly.
- * Refactoring hundreds of call sites to use a logger isn't practical.
- * Instead, we monkey-patch console.log/warn/error at the session level
- * to clear the prompt line before writing and redraw it after.
+ * In the tmux UI model, the main pane is for user interaction only.
+ * Worker status flows through .forge/worker-status.json and events.jsonl
+ * to the dedicated info panes (monitor, actions, queue).
  *
- * The interceptor also maintains a ring buffer of recent messages so
- * users can review worker activity via the /activity command.
+ * Background output (worker, agents) is silently discarded.
+ * Session-owned output (commands, banners) uses unsuppress/suppress
+ * bracketing to temporarily restore console during command execution.
  */
 
-import type * as readline from 'node:readline';
-
-export interface BufferedMessage {
-  readonly time: number;
-  readonly level: 'log' | 'warn' | 'error';
-  readonly text: string;
-}
-
-const MAX_BUFFER = 500;
-
 export class OutputInterceptor {
-  private rl: readline.Interface | null = null;
   private readonly originalLog = console.log;
   private readonly originalWarn = console.warn;
   private readonly originalError = console.error;
-  private readonly buffer: BufferedMessage[] = [];
-  private active = false;
+  private suppressed = false;
 
   /**
-   * Begin intercepting console output. All writes will be coordinated
-   * with the readline prompt so the user's input is never stomped.
+   * Begin suppressing background console output.
+   * Worker/agent output is silently discarded.
    */
-  start(rl: readline.Interface): void {
-    this.rl = rl;
-    this.active = true;
-
-    console.log = this.createInterceptor('log', this.originalLog);
-    console.warn = this.createInterceptor('warn', this.originalWarn);
-    console.error = this.createInterceptor('error', this.originalError);
+  start(): void {
+    this.suppressed = true;
+    this.suppress();
   }
 
-  /**
-   * Stop intercepting — restore original console methods.
-   */
+  /** Stop suppressing — restore original console methods. */
   stop(): void {
-    this.active = false;
-    this.rl = null;
-    console.log = this.originalLog;
-    console.warn = this.originalWarn;
-    console.error = this.originalError;
+    this.suppressed = false;
+    this.restore();
   }
 
   /**
-   * Get recent buffered messages for the /activity command.
+   * Temporarily restore console for session-owned output
+   * (command handlers, banners, etc). Call suppress() after.
    */
-  getRecent(count = 30): readonly BufferedMessage[] {
-    return this.buffer.slice(-count);
+  unsuppress(): void {
+    this.restore();
   }
 
-  /**
-   * Write directly to stdout without interception — used for the
-   * session's own UI elements (banners, command output).
-   */
+  /** Re-suppress after session-owned output is done. */
+  suppress(): void {
+    if (!this.suppressed) return;
+    const noop = () => {};
+    console.log = noop;
+    console.warn = noop;
+    console.error = noop;
+  }
+
+  /** Write directly — always works regardless of suppression state. */
   writeDirect(...args: unknown[]): void {
     this.originalLog.apply(console, args);
   }
 
-  /**
-   * Create an interceptor function for a given console method.
-   *
-   * The pattern: clear the prompt line → write output → redraw prompt.
-   * readline's internal _refreshLine() redraws the prompt string plus
-   * whatever the user has typed so far, preserving their cursor position.
-   */
-  private createInterceptor(
-    level: BufferedMessage['level'],
-    original: (...args: unknown[]) => void,
-  ): (...args: unknown[]) => void {
-    return (...args: unknown[]) => {
-      // Buffer the message text (strip ANSI for storage)
-      const text = args
-        .map((a) => (typeof a === 'string' ? a : String(a)))
-        .join(' ');
-      this.buffer.push({ time: Date.now(), level, text });
-      if (this.buffer.length > MAX_BUFFER) {
-        this.buffer.shift();
-      }
-
-      if (!this.active || !this.rl) {
-        original.apply(console, args);
-        return;
-      }
-
-      // Clear the current prompt line (move to column 0, erase line)
-      process.stdout.write('\r\x1b[K');
-
-      // Write the actual output via the original method
-      original.apply(console, args);
-
-      // Redraw the prompt + user's partial input.
-      // _refreshLine is readline's internal method that redraws
-      // prompt + line + positions cursor. Stable across Node 18+.
-      const rlAny = this.rl as unknown as Record<string, unknown>;
-      if (typeof rlAny._refreshLine === 'function') {
-        (rlAny._refreshLine as () => void)();
-      } else {
-        // Fallback: just redraw the prompt (loses partial input)
-        this.rl.prompt(true);
-      }
-    };
+  private restore(): void {
+    console.log = this.originalLog;
+    console.warn = this.originalWarn;
+    console.error = this.originalError;
   }
 }

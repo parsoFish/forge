@@ -36,22 +36,17 @@ import { Orchestrator } from './orchestrator.js';
 import { Worker } from './jobs/index.js';
 import { EventLog } from './events/index.js';
 import { Session } from './session/index.js';
+import { launchUI, startMonitorPane, startQueuePane, startActionsPane } from './ui/index.js';
 
 const program = new Command();
 
 program
   .name('forge')
   .description('Autonomous multi-agent orchestrator — a lead engineer for your codebase')
-  .version('0.3.0')
-  .action(async () => {
-    // No subcommand → start interactive session
-    try {
-      const session = new Session();
-      await session.start();
-    } catch (error) {
-      console.error(chalk.red('Session error:'), error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
+  .version('0.5.0')
+  .action(() => {
+    // No subcommand → launch the full tmux UI
+    launchUI();
   });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -321,6 +316,45 @@ program
       console.log(`  ${chalk.dim(time)} ${typeColor(event.type)} ${role} ${event.summary}`);
     }
     console.log();
+  });
+
+// ═══════════════════════════════════════════════════════════════════
+// UI — multi-pane tmux interface
+// ═══════════════════════════════════════════════════════════════════
+
+// Internal: the interactive REPL session that runs inside the tmux main pane.
+// Not intended for direct use — `forge` (no args) launches the full UI.
+program
+  .command('session', { hidden: true })
+  .action(async () => {
+    try {
+      const session = new Session();
+      await session.start();
+    } catch (error) {
+      console.error(chalk.red('Session error:'), error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('watch:monitor')
+  .description('Live monitoring pane (worker status, CPU/mem, slots, budget)')
+  .action(() => {
+    startMonitorPane();
+  });
+
+program
+  .command('watch:queue')
+  .description('Live job queue pane (priority view, ↑↓ to select, +/- to bump priority)')
+  .action(() => {
+    startQueuePane();
+  });
+
+program
+  .command('watch:actions')
+  .description('Live agent actions pane (one line per running agent, completed summaries)')
+  .action(() => {
+    startActionsPane();
   });
 
 program.parse();
