@@ -1,13 +1,13 @@
 /**
  * Workflow type definitions.
  *
- * Orchestrator operates in three mutually exclusive phases:
- *   roadmapping → planning → implementation
+ * Forge operates a six-phase lifecycle (see ADR-002):
+ *   roadmapping → implementation → review → merging → reflect
  *
  * The per-work-item pipeline flows:
  *   test → develop → pr → review
  *
- * Design + plan stages are now embedded in the roadmapping/planning phases.
+ * Design + plan stages are embedded in the implementation phase.
  */
 
 import type { AgentRole } from '../agents/types.js';
@@ -15,18 +15,22 @@ import type { AgentRole } from '../agents/types.js';
 // === Orchestrator Phases ===
 
 /**
- * Top-level orchestrator phase — mutually exclusive modes.
+ * Top-level orchestrator phase — lifecycle stages.
  *
- * - roadmapping: high-level roadmap generation with human direction
- * - planning: break roadmaps into dependency-ordered work items
- * - implementation: execute work items respecting dependency order
+ * - roadmapping: interactive — user sets direction per project (Opus)
+ * - implementation: autonomous — design/plan/test/develop/pr pipeline (Sonnet)
+ * - review: interactive — triage and approve PRs (Haiku + Sonnet)
+ * - merging: autonomous — fix feedback, CI gates, merge (Sonnet)
+ * - reflect: interactive — analyze outcomes, extract learnings (Opus)
  */
-export type OrchestratorPhase = 'roadmapping' | 'planning' | 'implementation';
+export type OrchestratorPhase = 'roadmapping' | 'implementation' | 'review' | 'merging' | 'reflect';
 
 export const PHASE_ORDER: readonly OrchestratorPhase[] = [
   'roadmapping',
-  'planning',
   'implementation',
+  'review',
+  'merging',
+  'reflect',
 ] as const;
 
 /** Persisted state of the current orchestrator phase */

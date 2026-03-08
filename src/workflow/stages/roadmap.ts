@@ -67,7 +67,9 @@ Produce a roadmap as a JSON object:
     {
       "title": "Milestone title",
       "rationale": "Why this milestone matters and what it enables",
-      "acceptanceCriteria": ["Criterion 1", "Criterion 2"],
+      "acceptanceCriteria": ["Given X, When Y, Then Z", "Criterion 2"],
+      "edgeCases": ["What happens on failure or bad input"],
+      "nonGoals": ["What this milestone explicitly does NOT do"],
       "scope": "small|medium|large",
       "priority": "high|medium|low",
       "dependsOn": ["Title of milestone this depends on"]
@@ -83,7 +85,9 @@ Produce a roadmap as a JSON object:
 - **Be strategic, not tactical.** Milestones are "what to build", not "how to build it".
 - **Order by value and dependency.** Highest-impact items that unblock others come first.
 - **Keep milestones achievable.** Each should be completable in 1–5 focused work items.
-- **Be specific about acceptance criteria.** Vague criteria like "improve quality" are not acceptable.
+- **Be specific about acceptance criteria.** Use Given-When-Then format. Vague criteria like "improve quality" are never acceptable.
+- **Define non-goals.** Every milestone must say what it does NOT do to prevent scope creep.
+- **Identify edge cases.** What could go wrong? Boundary conditions? Failure modes?
 - Do NOT modify any files. You are read-only in this stage.
 - Output ONLY the JSON roadmap wrapped in a code block.`;
 

@@ -113,3 +113,4 @@ npm start              # Run orchestrator CLI
 - **One concern per PR.** If a refactor emerges during feature work, split it into a separate PR.
 - **When in doubt about architecture, refer to the core values above.**
 - **Fresh context is reliability** — re-read project state each cycle rather than relying on stale memory.
+- **Push to remote only after reflect.** Commits happen locally throughout development. Push to the forge remote only after the reflect phase completes and learnings are validated. This keeps the remote clean and ensures only verified, complete work is published.

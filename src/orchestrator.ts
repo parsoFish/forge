@@ -86,8 +86,6 @@ export class Orchestrator {
    * Returns immediately — use `forge worker` to execute.
    */
   async roadmap(projectName?: string, userDirection?: string): Promise<void> {
-    this.store.setPhase('roadmapping', userDirection ?? '');
-
     const projects = projectName
       ? [this.validateAndReturn(projectName)]
       : [...this.settings.projects];
@@ -111,8 +109,6 @@ export class Orchestrator {
    * Returns immediately — use `forge worker` to execute.
    */
   async plan(projectName?: string): Promise<void> {
-    this.store.setPhase('planning');
-
     const projects = projectName
       ? [this.validateAndReturn(projectName)]
       : [...this.settings.projects];
@@ -134,7 +130,7 @@ export class Orchestrator {
       return;
     }
 
-    const jobs = this.queue.postForProjects('plan', 'planning', valid, {});
+    const jobs = this.queue.postForProjects('plan', 'implementation', valid, {});
 
     console.log(chalk.bold.blue(`\n▶ Planning: queued ${jobs.length} job(s)`));
     for (const j of jobs) {
@@ -154,8 +150,6 @@ export class Orchestrator {
    * jobs when it processes these.
    */
   async implement(projectName?: string): Promise<void> {
-    this.store.setPhase('implementation');
-
     const projects = projectName
       ? [this.validateAndReturn(projectName)]
       : [...this.settings.projects];
@@ -492,7 +486,7 @@ export class Orchestrator {
       process.exit(1);
     }
 
-    const job = this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, projectName, {
+    const job = this.queue.post('pr-fix', 'pr-fix', projectName, {
       prNumber,
       repo: prData.repo,
       project: projectName,
@@ -577,7 +571,7 @@ export class Orchestrator {
       const headSha = pr.uniqueHeadSha || this.getHeadSha(execSync, pr);
       const layerPriority = 10 + Math.min(pr.mergeLayer, 5);
 
-      this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, pr.project, {
+      this.queue.post('pr-fix', 'pr-fix', pr.project, {
         prNumber: pr.number,
         repo: pr.repo,
         project: pr.project,
@@ -596,7 +590,7 @@ export class Orchestrator {
       const ancestors = chainAncestors.get(tipNum) ?? [];
       const headSha = tipPR.uniqueHeadSha || this.getHeadSha(execSync, tipPR);
 
-      this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, tipPR.project, {
+      this.queue.post('pr-fix', 'pr-fix', tipPR.project, {
         prNumber: tipPR.number,
         repo: tipPR.repo,
         project: tipPR.project,
@@ -659,7 +653,7 @@ export class Orchestrator {
     // Post jobs — the worker will execute them in priority order
     // (roadmap=10 → plan=20 → implement=30), so order is preserved.
     const roadmapJob = this.queue.post('roadmap', 'roadmapping', projectName, {});
-    const planJob = this.queue.post('plan', 'planning', projectName, {});
+    const planJob = this.queue.post('plan', 'implementation', projectName, {});
     const implJob = this.queue.post('implement', 'implementation', projectName, {});
 
     console.log(chalk.bold.blue(`\n▶ Full pipeline for ${projectName}: queued 3 jobs`));
@@ -681,7 +675,7 @@ export class Orchestrator {
     let total = 0;
     for (const project of this.settings.projects) {
       this.queue.post('roadmap', 'roadmapping', project, {});
-      this.queue.post('plan', 'planning', project, {});
+      this.queue.post('plan', 'implementation', project, {});
       this.queue.post('implement', 'implementation', project, {});
       total += 3;
     }
@@ -702,18 +696,23 @@ export class Orchestrator {
   async resume(projectOrWorkItemId?: string): Promise<void> {
     const phase = this.getCurrentPhase();
 
-    if (phase === 'roadmapping') {
-      await this.roadmap(projectOrWorkItemId);
-      return;
+    switch (phase) {
+      case 'roadmapping':
+        await this.roadmap(projectOrWorkItemId);
+        break;
+      case 'implementation':
+        await this.implement(projectOrWorkItemId);
+        break;
+      case 'review':
+        await this.review(projectOrWorkItemId);
+        break;
+      case 'merging':
+        await this.fixAll(projectOrWorkItemId);
+        break;
+      case 'reflect':
+        await this.reflect();
+        break;
     }
-
-    if (phase === 'planning') {
-      await this.plan(projectOrWorkItemId);
-      return;
-    }
-
-    // Default: implementation
-    await this.implement(projectOrWorkItemId);
   }
 
   /**

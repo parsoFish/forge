@@ -1,89 +1,111 @@
 # Workflow — Forge Orchestrator
 
-## Pipeline Overview
+## Lifecycle Overview
 
-Every project flows through a staged pipeline:
+Forge operates a six-phase lifecycle with two interactive leverage points:
 
 ```
-design → plan → [per work item: test → develop → pr → review]
+┌─────────────┐     ┌──────────────────────────┐     ┌─────────────┐
+│ 1. ROADMAP  │────▶│ 2. DESIGN/PLAN/DEV/TEST  │────▶│ 3. REVIEW   │
+│ (interactive)│     │    (autonomous)           │     │ (interactive)│
+└─────────────┘     └──────────────────────────┘     └──────┬──────┘
+       ▲                                                     │
+       │            ┌──────────────────────────┐             │
+       │            │ 5. REFLECT               │             ▼
+       └────────────│    (interactive)          │◀────┌──────────────┐
+                    └──────────────────────────┘     │ 4. MERGE     │
+                                                     │ (autonomous)  │
+                                                     └──────────────┘
 ```
 
-The first two stages (design, plan) operate at the **project level**.
-The remaining stages operate **per work item**.
+**Interactive phases** are where the human steers direction.
+**Autonomous phases** run without intervention, constrained by budget/concurrency caps.
+**Reflect** creates the feedback loop — learnings from each cycle inform the next roadmap.
 
-## Stage Details
+See [decisions/002-six-phase-architecture.md](decisions/002-six-phase-architecture.md) for the ADR.
 
-### 1. Design (Architect Agent)
+## Phase 1: Roadmap (Interactive, Opus)
 
-**Input:** A project directory
-**Output:** A design brief (JSON)
+The human sets direction per project. The system presents current state, completed work, blockers, and learnings from past reflections.
 
-The architect agent:
-- Reads the project's README, config files, and key source files
-- Assesses architecture, quality, testing, documentation
-- Proposes features with rationale, scope, and priority
-- Identifies tech debt and improvement opportunities
+**Trigger:** User initiates (`/roadmap`) or after reflect phase
+**Output:** Updated roadmaps with ordered milestones per project
 
-The design brief is saved to `.forge/designs/<project>.json`.
+```bash
+forge roadmap [project]       # Interactive roadmapping
+forge roadmap --all           # Roadmap all projects
+```
 
-### 2. Plan (Planner Agent)
+## Phase 2: Design / Plan / Develop / Test (Autonomous, Sonnet)
 
-**Input:** A design brief
-**Output:** A list of work items
+The full implementation pipeline. Each milestone spawns work items that flow through TDD:
 
-The planner agent:
-- Breaks each proposed feature into atomic work items
-- Defines acceptance criteria for each
-- Specifies the testing approach (which layers)
-- Orders by dependency (critical path first)
-- Names branches following conventions
+```
+design → plan → [per work item: test → develop → pr]
+```
 
-Work items are saved individually as `.forge/work-items/<id>.json`.
+### Design (Architect Agent)
+Analyzes the project holistically, proposes features with rationale and scope.
+Output: Design brief saved to `.forge/designs/<project>.json`.
 
-### 3. Test (Test Engineer Agent)
+### Plan (Planner Agent)
+Breaks features into atomic work items with acceptance criteria, test approach, and dependency order.
+Output: Work items saved as `.forge/work-items/<project>/<id>.json`.
 
-**Input:** A work item description
-**Output:** Failing tests on a feature branch
+### Test (Test Engineer Agent)
+Creates feature branch, writes failing tests at appropriate layers (unit, integration, e2e).
+Output: Branch with failing tests committed.
 
-The test engineer:
-- Creates the feature branch
-- Studies existing test patterns and frameworks
-- Designs tests at appropriate layers (unit, integration, e2e)
-- Writes tests that fail (implementation doesn't exist yet)
-- Commits the tests
-
-### 4. Develop (Developer Agent)
-
-**Input:** A branch with failing tests
-**Output:** Passing tests with clean implementation
-
-The developer:
-- Reads the failing tests to understand expected behavior
-- Implements the minimum code to make tests pass
-- Refactors after green
-- Runs ALL tests (new and existing)
-- Runs linters — zero warnings
-- Commits the implementation
-
+### Develop (Developer Agent)
+Implements minimum code to make tests pass, refactors, runs all tests and linters.
+Output: Branch with passing tests, zero warnings.
 **Quality gates:** All tests pass, zero lint warnings, zero type errors.
 
-### 5. PR (PR Creator Agent)
+### PR (PR Creator Agent)
+Pushes branch, creates pull request with why-focused description.
+Output: PR ready for review.
 
-**Input:** A branch with passing tests
-**Output:** A pull request on GitHub
+## Phase 3: Review (Interactive, Haiku + Sonnet)
 
-The PR creator:
-- Pushes the branch to origin
-- Creates a PR with why-focused description
-- Adds appropriate labels
+The second human leverage point. Two-tier review:
 
-### 6. Review (Terminal State)
+1. **Haiku triage** — Quick categorization, obvious issues
+2. **Sonnet deep review** — Architecture, logic, edge cases
+3. **Human review** — Approve, request changes, or redirect
 
-**Input:** A pull request
-**Output:** Work item marked for human review
+```bash
+forge review                  # Interactive PR review
+forge review --project <name> # Review specific project
+```
 
-The review stage marks the work item as complete from the automation
-perspective. A human reviews and merges (or requests changes).
+## Phase 4: Merge Pipeline (Autonomous)
+
+After human approval, merge runs autonomously:
+
+1. **PlanMerge** — Analyze merge order, dependency chains, conflict potential
+2. **DevelopPR** — Fix review feedback, resolve conflicts (developer agent)
+3. **TestPR** — Run full test suite, verify CI passes
+4. **MergePR** — Merge when all gates pass
+
+Constraints: Max 3 fix rounds before human escalation. CI must pass. No force merges.
+
+```bash
+forge fix <pr> --project <name>   # Trigger fix loop for a specific PR
+forge fix-all [--project <name>]  # Fix all approved PRs
+```
+
+## Phase 5: Reflect (Interactive, Opus)
+
+Analyze what happened: completed, failed, blocked, cost patterns.
+Produce actionable recommendations that feed back into Phase 1.
+
+**Output:** Reflection report in `.forge/learnings/`, updated roadmap context.
+
+**Push to remote happens here.** Commits accumulate locally throughout the cycle. Only after reflect validates the learnings do we push to the forge remote. This keeps the published repo clean and ensures only complete, verified work is shared.
+
+```bash
+forge reflect                 # Run reflection analysis
+```
 
 ## Work Item States
 
@@ -95,19 +117,14 @@ pending → in-progress → completed
 
 ## Resuming Work
 
-If a work item fails or gets blocked, it can be resumed:
-
 ```bash
-forge resume <work-item-id>
+forge resume <work-item-id>   # Resume from current stage
 ```
-
-This picks up from the current stage with a fresh agent invocation.
 
 ## Research Agent
 
-Independently of project work, the research agent periodically investigates
-new patterns, tools, and approaches in the AI agent orchestration space.
-Findings are saved to `.forge/research/` as markdown reports.
+Independently investigates new patterns, tools, and approaches.
+Findings saved to `.forge/research/` as markdown reports.
 
 ```bash
 forge research

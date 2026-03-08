@@ -1,0 +1,45 @@
+Business Source License 1.1
+
+Licensor: parsoFish
+Licensed Work: Forge Orchestrator
+
+The Licensed Work is (c) 2026 parsoFish.
+
+Change License: MIT License
+Change Date: Four years from the date the Licensed Work is published.
+
+Grant of Rights:
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work.
+
+The Licensor may make an Additional Use Grant, above, permitting limited
+production use.
+
+Limitations:
+
+Notwithstanding the above, the Licensed Work may not be used for a
+Production Purpose without a separate commercial license from the Licensor.
+
+A "Production Purpose" means any use of the Licensed Work that is intended
+to generate revenue, whether directly or indirectly, including but not
+limited to:
+  - Offering the Licensed Work as a hosted service
+  - Incorporating the Licensed Work into a commercial product
+  - Using the Licensed Work to provide services to third parties
+
+For the avoidance of doubt, the following uses are NOT considered Production
+Purposes and are permitted without a commercial license:
+  - Personal use and experimentation
+  - Academic and research use
+  - Contributing back to this project
+  - Evaluating the Licensed Work for potential commercial licensing
+
+Notice:
+
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
+
+For more information on the Business Source License, please visit:
+https://mariadb.com/bsl11/

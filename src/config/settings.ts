@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cpus } from 'node:os';
 import type { BudgetConfig } from '../budget/budget-tracker.js';
@@ -82,9 +82,9 @@ const DEFAULT_CONCURRENCY: ConcurrencyConfig = {
 };
 
 const DEFAULT_SETTINGS: ForgeSettings = {
-  workspaceRoot: '/home/parso/sideProjects',
+  workspaceRoot: process.cwd(),
   projectsDir: 'projects',
-  projects: ['trafficGame', 'simplarr', 'env-optimiser', 'GitWeave'],
+  projects: [],             // Auto-discovered from projectsDir if empty
   models: {
     architect: 'sonnet',      // Design needs strong reasoning
     planner: 'sonnet',        // Planning needs structure
@@ -107,8 +107,10 @@ const DEFAULT_SETTINGS: ForgeSettings = {
 const SETTINGS_FILE = 'forge.config.json';
 
 export function loadSettings(workspaceRoot?: string): ForgeSettings {
-  const root = workspaceRoot ?? DEFAULT_SETTINGS.workspaceRoot;
+  const root = workspaceRoot ?? process.cwd();
   const configPath = resolve(root, SETTINGS_FILE);
+
+  let settings: ForgeSettings;
 
   if (existsSync(configPath)) {
     const raw = readFileSync(configPath, 'utf-8');
@@ -122,7 +124,7 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
     // Migrate legacy maxConcurrency → concurrency.ceiling
     const legacyCeiling = overrides.maxConcurrency;
 
-    return {
+    settings = {
       ...DEFAULT_SETTINGS,
       ...overrides,
       workspaceRoot: root,
@@ -145,9 +147,22 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
         ...(overrides.resourceSlots ?? overrides.resourceThresholds?.resourceSlots ?? {}),
       },
     };
+  } else {
+    settings = { ...DEFAULT_SETTINGS, workspaceRoot: root };
   }
 
-  return { ...DEFAULT_SETTINGS, workspaceRoot: root };
+  // Auto-discover projects from projectsDir if none specified
+  if (settings.projects.length === 0) {
+    const projectsPath = resolve(root, settings.projectsDir);
+    if (existsSync(projectsPath)) {
+      const discovered = readdirSync(projectsPath, { withFileTypes: true })
+        .filter((entry: import('node:fs').Dirent) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map((entry: import('node:fs').Dirent) => entry.name);
+      settings = { ...settings, projects: discovered };
+    }
+  }
+
+  return settings;
 }
 
 /**

@@ -252,7 +252,7 @@ program
 
 program
   .command('phase [phase]')
-  .description('Show or switch the current orchestrator phase (roadmapping, planning, implementation)')
+  .description('Show or switch the orchestrator phase (roadmapping, implementation, review, merging, reflect)')
   .option('-n, --notes <text>', 'Optional notes for the phase switch')
   .action((phase?: string, opts?: { notes?: string }) => {
     const orch = new Orchestrator();
@@ -261,7 +261,7 @@ program
       console.log(chalk.bold(`\n  Current phase: ${current}\n`));
       return;
     }
-    const validPhases = ['roadmapping', 'planning', 'implementation'] as const;
+    const validPhases = ['roadmapping', 'implementation', 'review', 'merging', 'reflect'] as const;
     if (!validPhases.includes(phase as typeof validPhases[number])) {
       console.error(chalk.red(`Invalid phase: "${phase}". Valid: ${validPhases.join(', ')}`));
       process.exit(1);

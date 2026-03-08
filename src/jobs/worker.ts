@@ -33,7 +33,7 @@ import { ResourceMonitor, DEFAULT_THRESHOLDS } from '../monitor/index.js';
 import { AdaptiveConcurrency } from '../monitor/adaptive-concurrency.js';
 import { ResourceProfiler, type ResourceObservation } from '../monitor/resource-profiler.js';
 import { JobQueue } from './queue.js';
-import type { Job, JobPhase } from './types.js';
+import type { Job } from './types.js';
 import { runRoadmapStage } from '../workflow/stages/roadmap.js';
 import { runPlanStage } from '../workflow/stages/plan.js';
 import { runTestStage } from '../workflow/stages/test.js';
@@ -909,7 +909,7 @@ export class Worker {
           const userFeedback = job.metadata.userFeedback as string | undefined;
           const feedbackNote = userFeedback ? ` (with user feedback)` : '';
           console.log(chalk.cyan(`  PR #${prNumber}: initial review posted — auto-fixing (user-triaged${feedbackNote})`));
-          this.queue.post('pr-fix', 'pr-fix' as JobPhase, project, {
+          this.queue.post('pr-fix', 'pr-fix', project, {
             ...job.metadata,
             fixRound: 1,
             lastReviewedSha: currentRemoteSha || undefined,
@@ -935,7 +935,7 @@ export class Worker {
           } else {
             // Autonomous loop — queue the fix
             console.log(chalk.dim(`  PR #${prNumber}: queuing fix round ${nextRound}/${MAX_FIX_ROUNDS}`));
-            this.queue.post('pr-fix', 'pr-fix' as JobPhase, project, {
+            this.queue.post('pr-fix', 'pr-fix', project, {
               ...job.metadata,
               fixRound: nextRound,
               lastReviewedSha: currentRemoteSha || undefined,
@@ -955,7 +955,7 @@ export class Worker {
 
     // Post one review job per PR; priority = 5 + mergeLayer so foundation PRs run first
     for (const pr of openPRs) {
-      this.queue.post('review', 'review' as JobPhase, pr.project, {
+      this.queue.post('review', 'review', pr.project, {
         prNumber:      pr.number,
         prTitle:       pr.title,
         prUrl:         pr.url,
@@ -1065,7 +1065,7 @@ export class Worker {
         }
 
         // Queue a review job for this now-unblocked PR
-        this.queue.post('review', 'review' as JobPhase, project, {
+        this.queue.post('review', 'review', project, {
           prNumber: depPr.number,
           prTitle: depPr.title,
           prUrl: depPr.url,
@@ -1276,7 +1276,7 @@ Your final line MUST be one of:
     const fixSucceeded = !/FAILED|FIX BLOCKED|ESCALATE/i.test(result.output);
 
     if (fixSucceeded && pushLanded) {
-      this.queue.post('review', 'review' as JobPhase, project, {
+      this.queue.post('review', 'review', project, {
         ...job.metadata,
         fixRound,
         lastReviewedSha: currentRemoteSha || lastReviewedSha,
@@ -1576,7 +1576,7 @@ Your final line MUST be one of:
         );
         if (existing) continue;
 
-        this.queue.post('pr-fix', 'review' as JobPhase, pr.project, {
+        this.queue.post('pr-fix', 'review', pr.project, {
           prNumber: pr.number,
           branch: pr.branch,
           repo: pr.repo,

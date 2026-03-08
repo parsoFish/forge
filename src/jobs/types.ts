@@ -16,8 +16,8 @@
 
 import type { OrchestratorPhase } from '../workflow/types.js';
 
-/** Phase for job context — extends OrchestratorPhase with 'reflection' */
-export type JobPhase = OrchestratorPhase | 'reflection' | 'review' | 'pr-fix';
+/** Phase for job context — extends OrchestratorPhase with job-specific phases */
+export type JobPhase = OrchestratorPhase | 'reflection' | 'pr-fix';
 
 /** The types of jobs the orchestrator can post */
 export type JobType =
