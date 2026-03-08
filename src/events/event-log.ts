@@ -13,7 +13,7 @@
  * by what work was being done — without needing to open the file.
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync, createWriteStream, readdirSync, unlinkSync, statSync, rmdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, createWriteStream, readdirSync, unlinkSync, statSync, rmdirSync, openSync, readSync, closeSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import type { WriteStream } from 'node:fs';
 
@@ -50,7 +50,13 @@ export type EventType =
   | 'review.scan'
   | 'pr-fix.complete'
   | 'pr.merged'
-  | 'tuning.report';
+  | 'pr.chain.closed'
+  | 'tuning.report'
+  | 'heartbeat.sync'
+  | 'heartbeat.merge'
+  | 'heartbeat.retry'
+  | 'heartbeat.queue'
+  | 'agent.orphaned';
 
 export interface ForgeEvent {
   readonly timestamp: string;
@@ -172,23 +178,33 @@ export class EventLog {
 
   /**
    * Read recent events from the global log.
+   *
+   * WHY tail-read instead of full-file read:
+   * The events file grows unbounded (264K+ lines / 38MB+). Reading the whole
+   * file into memory just to take the last N lines caused OOM crashes.
+   * This reads backwards from EOF in fixed-size chunks — O(N) in the number
+   * of requested lines, not O(file-size).
    */
   recent(count = 50): ForgeEvent[] {
     if (!existsSync(this.eventsPath)) return [];
-    const lines = readFileSync(this.eventsPath, 'utf-8')
-      .trim()
-      .split('\n')
-      .filter(Boolean);
-    return lines
-      .slice(-count)
-      .map((line) => JSON.parse(line) as ForgeEvent);
+    const lines = this.tailLines(this.eventsPath, count);
+    return lines.map((line) => JSON.parse(line) as ForgeEvent);
   }
 
   /**
    * Read events for a specific project.
+   *
+   * Reads more lines than requested since we filter by project after.
+   * Uses a multiplier to increase odds of finding enough matches.
    */
   forProject(project: string, count = 50): ForgeEvent[] {
-    return this.recent(count * 3).filter((e) => e.project === project).slice(-count);
+    const candidates = this.tailLines(this.eventsPath, count * 5);
+    const events: ForgeEvent[] = [];
+    for (const line of candidates) {
+      const event = JSON.parse(line) as ForgeEvent;
+      if (event.project === project) events.push(event);
+    }
+    return events.slice(-count);
   }
 
   /**
@@ -273,6 +289,111 @@ export class EventLog {
     }
 
     return pruned;
+  }
+
+  /**
+   * Detect agents that spawned but never logged a result or error.
+   * These are agents that were killed (OOM, SIGKILL, process crash)
+   * without the parent process being able to log their termination.
+   *
+   * Scans the last `lookbackEvents` events. Returns orphaned run IDs
+   * and logs `agent.orphaned` events for each.
+   */
+  detectOrphans(lookbackEvents = 500): Array<{ runId: string; agentRole: string; project?: string }> {
+    const events = this.recent(lookbackEvents);
+    const spawned = new Map<string, { agentRole: string; project?: string; timestamp: string }>();
+    const completed = new Set<string>();
+
+    for (const event of events) {
+      if (event.type === 'agent.spawn' && event.runId) {
+        spawned.set(event.runId, {
+          agentRole: event.agentRole ?? 'unknown',
+          project: event.project,
+          timestamp: event.timestamp,
+        });
+      }
+      if ((event.type === 'agent.result' || event.type === 'agent.error' || event.type === 'agent.orphaned') && event.runId) {
+        completed.add(event.runId);
+      }
+    }
+
+    const orphans: Array<{ runId: string; agentRole: string; project?: string }> = [];
+    for (const [runId, meta] of spawned) {
+      if (!completed.has(runId)) {
+        orphans.push({ runId, agentRole: meta.agentRole, project: meta.project });
+        this.emit({
+          type: 'agent.orphaned',
+          agentRole: meta.agentRole,
+          runId,
+          project: meta.project,
+          summary: `Orphaned: ${meta.agentRole} [${runId}] (spawned ${meta.timestamp}, never completed — likely OOM/SIGKILL)`,
+        });
+      }
+    }
+
+    return orphans;
+  }
+
+  /**
+   * Rotate the event log — keep the most recent `keepLines` lines,
+   * discard the rest. This prevents unbounded growth.
+   *
+   * Returns the number of lines discarded.
+   */
+  rotate(keepLines = 5000): number {
+    if (!existsSync(this.eventsPath)) return 0;
+    const stat = statSync(this.eventsPath);
+    // Skip rotation for small files (< 1MB)
+    if (stat.size < 1_000_000) return 0;
+
+    const kept = this.tailLines(this.eventsPath, keepLines);
+
+    // Atomic replace: write to temp, then rename
+    const tmpPath = this.eventsPath + '.tmp';
+    writeFileSync(tmpPath, kept.join('\n') + '\n');
+    const oldSize = stat.size;
+    renameSync(tmpPath, this.eventsPath);
+    const newSize = statSync(this.eventsPath).size;
+
+    // Return approximate lines discarded based on size reduction
+    const ratio = oldSize > 0 ? newSize / oldSize : 1;
+    return Math.round(kept.length * ((1 / ratio) - 1));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Private Helpers
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Read the last N lines from a file by reading backwards from EOF.
+   * Only allocates memory proportional to the bytes needed, not the file size.
+   */
+  private tailLines(filePath: string, count: number): string[] {
+    if (!existsSync(filePath)) return [];
+    const stat = statSync(filePath);
+    if (stat.size === 0) return [];
+
+    const fd = openSync(filePath, 'r');
+    try {
+      // Read in 64KB chunks from the end
+      const CHUNK_SIZE = 65_536;
+      let position = stat.size;
+      let tail = '';
+      let lines: string[] = [];
+
+      while (position > 0 && lines.length <= count) {
+        const readSize = Math.min(CHUNK_SIZE, position);
+        position -= readSize;
+        const buffer = Buffer.alloc(readSize);
+        readSync(fd, buffer, 0, readSize, position);
+        tail = buffer.toString('utf-8') + tail;
+        lines = tail.split('\n').filter(Boolean);
+      }
+
+      return lines.slice(-count);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   private parseLogFile(path: string): Record<string, unknown>[] {

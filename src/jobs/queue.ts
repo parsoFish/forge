@@ -249,22 +249,47 @@ export class JobQueue {
   }
 
   /**
-   * Clean up old completed/failed/cancelled jobs (older than daysOld days).
+   * Clean up old completed/failed/cancelled jobs.
+   *
+   * Two pruning strategies to prevent runaway job file growth:
+   * 1. Time-based: remove jobs older than `daysOld` days
+   * 2. Count-based: keep at most `maxCompleted` completed jobs (newest first)
    */
-  prune(daysOld = 7): number {
+  prune(daysOld = 1, maxCompleted = 200): number {
     const cutoff = Date.now() - daysOld * 24 * 60 * 60 * 1000;
     let pruned = 0;
-    for (const job of this.all()) {
-      if (
-        (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') &&
-        new Date(job.completedAt ?? job.createdAt).getTime() < cutoff
-      ) {
+
+    const terminal = this.all().filter(
+      (j) => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled',
+    );
+
+    // Time-based pruning
+    for (const job of terminal) {
+      if (new Date(job.completedAt ?? job.createdAt).getTime() < cutoff) {
         try {
           unlinkSync(join(this.dir, `${job.id}.json`));
           pruned++;
         } catch { /* ignore */ }
       }
     }
+
+    // Count-based pruning — if still too many, remove oldest
+    const remaining = terminal.filter((j) => {
+      try { return existsSync(join(this.dir, `${j.id}.json`)); } catch { return false; }
+    });
+    if (remaining.length > maxCompleted) {
+      const sorted = remaining.sort(
+        (a, b) => new Date(a.completedAt ?? a.createdAt).getTime() - new Date(b.completedAt ?? b.createdAt).getTime(),
+      );
+      const toRemove = sorted.slice(0, remaining.length - maxCompleted);
+      for (const job of toRemove) {
+        try {
+          unlinkSync(join(this.dir, `${job.id}.json`));
+          pruned++;
+        } catch { /* ignore */ }
+      }
+    }
+
     return pruned;
   }
 
