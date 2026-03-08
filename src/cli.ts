@@ -37,13 +37,14 @@ import { Worker } from './jobs/index.js';
 import { EventLog } from './events/index.js';
 import { Session } from './session/index.js';
 import { launchUI, startMonitorPane, startQueuePane, startActionsPane } from './ui/index.js';
+import { VERSION } from './version.js';
 
 const program = new Command();
 
 program
   .name('forge')
   .description('Autonomous multi-agent orchestrator — a lead engineer for your codebase')
-  .version('0.5.0')
+  .version(VERSION)
   .action(() => {
     // No subcommand → launch the full tmux UI
     launchUI();

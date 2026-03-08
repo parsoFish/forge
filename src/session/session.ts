@@ -25,6 +25,7 @@ import { Worker } from '../jobs/worker.js';
 import { setSessionMode } from '../agents/runner.js';
 import { OutputInterceptor } from './output.js';
 import { dispatchCommand, type CommandContext } from './commands.js';
+import { VERSION } from '../version.js';
 
 /** How long to wait before auto-resuming after a rate limit (buffer on top of reset time). */
 const RESUME_BUFFER_MS = 5_000;
@@ -141,9 +142,14 @@ export class Session {
   // ══════════════════════════════════════════════════════════════════
 
   private printBanner(): void {
-    console.log(chalk.bold.blue('\n╔══════════════════════════════════════════╗'));
-    console.log(chalk.bold.blue('║') + chalk.bold('         Forge Orchestrator v0.5.0        ') + chalk.bold.blue('║'));
-    console.log(chalk.bold.blue('╚══════════════════════════════════════════╝'));
+    const title = `Forge Orchestrator v${VERSION}`;
+    const width = 42;
+    const pad = Math.max(0, width - title.length);
+    const left = Math.floor(pad / 2);
+    const right = pad - left;
+    console.log(chalk.bold.blue('\n╔' + '═'.repeat(width) + '╗'));
+    console.log(chalk.bold.blue('║') + chalk.bold(' '.repeat(left) + title + ' '.repeat(right)) + chalk.bold.blue('║'));
+    console.log(chalk.bold.blue('╚' + '═'.repeat(width) + '╝'));
     console.log();
     console.log(chalk.dim('  Type /help for commands, /quit to exit.'));
     console.log(chalk.dim('  Worker is OFF by default. Use /worker on to start processing.'));
