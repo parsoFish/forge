@@ -24,8 +24,8 @@ import { execSync } from 'node:child_process';
 import { mkdirSync, rmSync } from 'node:fs';
 import chalk from 'chalk';
 import { loadAgents, type AgentRole, type AgentDefinition } from '../agents/index.js';
-import { setGlobalEventLog, runAgent } from '../agents/runner.js';
-import { loadSettings, type ForgeSettings } from '../config/index.js';
+import { setGlobalEventLog, runAgent, parseRateLimitReset } from '../agents/runner.js';
+import { loadSettings, resolveProjectPath, type ForgeSettings } from '../config/index.js';
 import { StateStore } from '../state/index.js';
 import { EventLog } from '../events/index.js';
 import { BudgetTracker } from '../budget/index.js';
@@ -44,6 +44,17 @@ import { STAGE_AGENT_MAP, type WorkItem } from '../workflow/types.js';
 
 const POLL_INTERVAL_MS = 3_000;  // Check for new jobs every 3s
 const IDLE_LOG_INTERVAL_MS = 60_000;  // Log "still waiting" every 60s when idle
+
+/**
+ * Thrown by job executors when a job should be put back in the queue
+ * instead of marked complete or failed (e.g. dependency not met).
+ */
+class JobDeferred extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'JobDeferred';
+  }
+}
 
 /**
  * Maps job types to the resource slots they consume.
@@ -70,10 +81,33 @@ export class Worker {
   private readonly queue: JobQueue;
 
   private _shutdownRequested = false;
+  private _paused = false;
   private _activeJobs = 0;
   private _processedCount = 0;
+  /** When rate-limited, the time (ms epoch) we can resume. 0 = not limited. */
+  private _rateLimitResetAt = 0;
+  /** Tracks processed count at end of each tick to detect no-progress spins. */
+  private _lastTickProcessed = 0;
+  private _noProgressTicks = 0;
+  /** Last slot name logged as blocked — avoids spamming the same message. */
+  private _lastSlotBlockLogged: string | null = null;
   /** Promises for all in-flight jobs — tracked so we can await them on shutdown. */
   private readonly _inflightJobs = new Set<Promise<void>>();
+
+  // ── Session integration callbacks ──────────────────────────────
+
+  /**
+   * Called when the worker hits a rate limit. The session uses this to
+   * auto-pause the worker and schedule a resume timer.
+   * @param resetAt - ms epoch when the rate limit resets
+   */
+  onRateLimited?: (resetAt: number) => void;
+
+  /**
+   * Called when the budget is exhausted. The session uses this to
+   * auto-pause the worker.
+   */
+  onBudgetExhausted?: () => void;
 
   constructor(workspaceRoot?: string) {
     this.settings = loadSettings(workspaceRoot);
@@ -94,6 +128,62 @@ export class Worker {
 
     setGlobalEventLog(this.eventLog);
     this.setupShutdownHandlers();
+  }
+
+  /**
+   * Pause the worker — stops claiming new jobs but lets in-flight jobs
+   * finish naturally. Used by the session for rate limit recovery and
+   * manual toggle.
+   */
+  pause(): void {
+    if (this._paused) return;
+    this._paused = true;
+    console.log(chalk.dim('  ⏸ Worker paused'));
+  }
+
+  /**
+   * Resume a paused worker — start claiming jobs again on the next tick.
+   */
+  resume(): void {
+    if (!this._paused) return;
+    this._paused = false;
+    this._rateLimitResetAt = 0; // Clear any stale rate limit
+    console.log(chalk.dim('  ▶ Worker resumed'));
+  }
+
+  /** Whether the worker is currently paused. */
+  get isPaused(): boolean {
+    return this._paused;
+  }
+
+  /** The rate limit reset time (ms epoch), or 0 if not rate-limited. */
+  get rateLimitResetTime(): number {
+    return this._rateLimitResetAt;
+  }
+
+  /** Number of jobs currently executing. */
+  get activeJobCount(): number {
+    return this._activeJobs;
+  }
+
+  /** Number of jobs processed this session. */
+  get processedCount(): number {
+    return this._processedCount;
+  }
+
+  /** Expose the job queue for monitoring (read-only access). */
+  get jobQueue(): JobQueue {
+    return this.queue;
+  }
+
+  /** Expose the resource monitor for monitoring (read-only access). */
+  get resourceMonitor(): ResourceMonitor {
+    return this.resources;
+  }
+
+  /** Expose the budget tracker for monitoring (read-only access). */
+  get budgetTracker(): BudgetTracker {
+    return this.budget;
   }
 
   /**
@@ -118,39 +208,78 @@ export class Worker {
       console.log(chalk.yellow(`  Recovered ${recovered} stuck job(s) from previous run.`));
     }
 
-    // Prune old completed jobs and stale logs
+    // Detect agents orphaned by a previous crash (OOM, SIGKILL, etc.)
+    const orphans = this.eventLog.detectOrphans();
+    if (orphans.length > 0) {
+      console.log(chalk.yellow(`  Detected ${orphans.length} orphaned agent(s) from previous run:`));
+      for (const o of orphans) {
+        console.log(chalk.dim(`    - ${o.agentRole} [${o.runId}]${o.project ? ` (${o.project})` : ''}`));
+      }
+    }
+
+    // Prune old completed jobs and stale logs, rotate event log
     const pruned = this.queue.prune();
     const prunedLogs = this.eventLog.pruneLogs();
-    if (pruned > 0 || prunedLogs > 0) {
+    const rotated = this.eventLog.rotate(5000);
+    if (pruned > 0 || prunedLogs > 0 || rotated > 0) {
       const parts = [];
       if (pruned > 0) parts.push(`${pruned} old job(s)`);
       if (prunedLogs > 0) parts.push(`${prunedLogs} old log(s)`);
+      if (rotated > 0) parts.push(`~${rotated} old event(s) rotated`);
       console.log(chalk.dim(`  Pruned ${parts.join(', ')}.`));
     }
 
     const maxConcurrency = this.settings.maxConcurrency;
-
-    console.log(chalk.bold.blue('\n▶ Forge Worker started'));
-    console.log(chalk.dim(`  Budget: ${this.budget.summary()}`));
-    console.log(chalk.dim(`  ${this.resources.summary()}`));
-    console.log(chalk.dim(`  Queue: ${this.queue.summaryString()}`));
-    console.log(chalk.dim(`  Concurrency: ${maxConcurrency} parallel jobs`));
-    console.log(chalk.dim(`  Mode: ${keepAlive ? 'daemon (keep-alive)' : 'drain (exit when empty)'}`));
-    console.log();
-
-    this.eventLog.emit({
-      type: 'worker.start',
-      summary: `Worker started (concurrency=${maxConcurrency}). Queue: ${this.queue.summaryString()}`,
-    });
-
+    let bannerPrinted = false;
     let lastIdleLog = 0;
 
     while (!this._shutdownRequested) {
+      // Pause gate — sleep while paused, but keep the loop alive
+      if (this._paused) {
+        await this.sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+
+      // Print the startup banner once when the worker first starts processing
+      if (!bannerPrinted) {
+        bannerPrinted = true;
+        console.log(chalk.bold.green('\n  ▶ Worker enabled'));
+        console.log(chalk.dim(`    Budget: ${this.budget.summary()}`));
+        console.log(chalk.dim(`    Queue: ${this.queue.summaryString()}`));
+        console.log(chalk.dim(`    Concurrency: ${maxConcurrency} parallel jobs`));
+        console.log();
+        this.eventLog.emit({
+          type: 'worker.start',
+          summary: `Worker started (concurrency=${maxConcurrency}). Queue: ${this.queue.summaryString()}`,
+        });
+      }
+
       // Budget gate
       if (!this.budget.canAfford()) {
         console.log(chalk.red(`\n  ⛔ Budget exhausted. ${this.budget.summary()}`));
         console.log(chalk.dim('     Start a new worker session to continue.\n'));
+        this.onBudgetExhausted?.();
         break;
+      }
+
+      // Rate limit gate — notify the session and pause instead of sleeping inline.
+      // The session will schedule a resume timer and re-enable the worker.
+      if (this._rateLimitResetAt > Date.now()) {
+        const waitMs = this._rateLimitResetAt - Date.now();
+        const resumeTime = new Date(this._rateLimitResetAt).toLocaleTimeString();
+        console.log(chalk.yellow(`  ⏳ Rate limited — resuming at ${resumeTime} (${Math.ceil(waitMs / 1000)}s)`));
+
+        if (this.onRateLimited) {
+          // Session mode: delegate recovery to the session
+          this.onRateLimited(this._rateLimitResetAt);
+          this._paused = true;
+          continue;
+        }
+
+        // Standalone worker mode: sleep inline
+        await this.sleep(Math.min(waitMs + 2000, 600_000)); // +2s buffer, cap 10min
+        this._rateLimitResetAt = 0;
+        continue; // Re-check budget/health before claiming
       }
 
       // Resource gate
@@ -163,19 +292,28 @@ export class Worker {
       // Fill available concurrency slots
       let claimedAny = false;
       while (this._activeJobs < maxConcurrency && !this._shutdownRequested) {
-        const job = this.queue.claim();
-        if (!job) break;  // No more queued jobs
+        // Pre-check: peek at the next queued job's type and verify slot
+        // availability BEFORE claiming. This avoids the expensive
+        // claim→unclaim disk I/O cycle when slots are known-full.
+        const peeked = this.queue.queued()[0];
+        if (!peeked) break;  // No more queued jobs
 
-        // Check resource slot availability for heavyweight jobs.
-        // If slots are full, unclaim and skip — it'll be retried next tick.
-        const requiredSlots = JOB_RESOURCE_SLOTS[job.type] ?? [];
+        const requiredSlots = JOB_RESOURCE_SLOTS[peeked.type] ?? [];
         const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
         if (blocked) {
-          this.queue.unclaim(job.id);
+          // Only log once per blocked period to avoid spam
+          if (!this._lastSlotBlockLogged || this._lastSlotBlockLogged !== blocked) {
+            this._lastSlotBlockLogged = blocked;
+            console.log(chalk.dim(`  ⏳ ${peeked.type} for ${peeked.project ?? '?'} waiting on "${blocked}" slot (${this.resources.slotSnapshot()[blocked]?.used ?? 0}/${this.resources.slotSnapshot()[blocked]?.capacity ?? '?'})`));
+          }
           this.resources.recordBlock(blocked);
-          console.log(chalk.dim(`  ⏳ ${job.type} for ${job.project ?? '?'} waiting on "${blocked}" slot`));
-          break; // Don't try more jobs this tick — slots won't free until a job finishes
+          break; // Slots won't free until an in-flight job finishes
         }
+        this._lastSlotBlockLogged = null;
+
+        // Now actually claim from disk — slots are available
+        const job = this.queue.claim();
+        if (!job) break;
 
         // Acquire all required slots
         for (const slot of requiredSlots) {
@@ -206,13 +344,36 @@ export class Worker {
           break;
         }
 
-        // Keep-alive: log idle status periodically
+        // Keep-alive: run heartbeat to close the autonomous loop
         const now = Date.now();
         if (now - lastIdleLog > IDLE_LOG_INTERVAL_MS) {
-          console.log(chalk.dim(`  [${new Date().toLocaleTimeString()}] Waiting for jobs... (${this.queue.summaryString()})`));
+          console.log(chalk.dim(`  [${new Date().toLocaleTimeString()}] Heartbeat — checking for merged PRs, unblocked work...`));
+          await this.heartbeat();
           lastIdleLog = now;
+
+          // If heartbeat queued new work, skip the poll sleep and claim immediately
+          if (this.queue.hasWork()) continue;
+          console.log(chalk.dim(`  [${new Date().toLocaleTimeString()}] Waiting for jobs... (${this.queue.summaryString()})`));
         }
       }
+
+      // Detect no-progress spins: if jobs are queued but nothing actually ran
+      // (e.g. all dependency-blocked), back off exponentially to avoid tight loops.
+      if (this._processedCount === this._lastTickProcessed && this._activeJobs === 0 && claimedAny) {
+        this._noProgressTicks++;
+        // Back off: 10s, 20s, 30s... up to 60s between checks
+        const backoffMs = Math.min(this._noProgressTicks * 10_000, 60_000);
+        if (this._noProgressTicks === 1) {
+          const queuedCount = this.queue.summary().queued;
+          console.log(chalk.dim(`  [${new Date().toLocaleTimeString()}] ${queuedCount} job(s) waiting on dependencies — running heartbeat`));
+          // Heartbeat may unblock work by syncing merged PRs or retrying failures
+          if (keepAlive) await this.heartbeat();
+        }
+        await this.sleep(backoffMs);
+        continue;
+      }
+      this._lastTickProcessed = this._processedCount;
+      this._noProgressTicks = 0;
 
       // Poll interval — check for new jobs or finished slots
       await this.sleep(POLL_INTERVAL_MS);
@@ -272,13 +433,14 @@ export class Worker {
         console.log(chalk.yellow(`    ${arrow} ${rec.slot}: ${rec.currentCapacity} → ${rec.suggestedCapacity} — ${rec.reason}`));
       }
 
-      // Show the JSON snippet to paste into config
+      // Show the exact JSON to merge into config
       const slotOverrides: Record<string, { capacity: number }> = {};
       for (const rec of report.recommendations) {
         slotOverrides[rec.slot] = { capacity: rec.suggestedCapacity };
       }
-      console.log(chalk.dim('\n  Add to forge.config.json:'));
-      console.log(chalk.dim(`  "resourceThresholds": { "resourceSlots": ${JSON.stringify(slotOverrides)} }`));
+      console.log(chalk.dim('\n  Add to forge.config.json → "resourceThresholds" → "resourceSlots":'));
+      console.log(chalk.dim(`  ${JSON.stringify(slotOverrides, null, 2).split('\n').join('\n  ')}`));
+      console.log(chalk.dim(`\n  Also consider updating "phaseConcurrency" → "develop" to match build slot capacity.`));
       console.log();
     } else if (report.totalSamples > 0) {
       console.log(chalk.green('  No tuning changes suggested — current config looks good.\n'));
@@ -347,14 +509,36 @@ export class Worker {
         summary: `Job complete: ${job.type}${job.project ? ` for ${job.project}` : ''} (${elapsed}s)`,
       });
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      this.queue.fail(job.id, msg);
+      // Deferred jobs go back in the queue — not completed, not failed
+      if (error instanceof JobDeferred) {
+        this.queue.unclaim(job.id);
+        return;
+      }
 
-      this.eventLog.emit({
-        type: 'job.failed',
-        project: job.project ?? undefined,
-        summary: `Job failed: ${job.type}${job.project ? ` for ${job.project}` : ''}: ${msg}`,
-      });
+      const msg = error instanceof Error ? error.message : String(error);
+
+      // Rate limit detection — re-queue instead of failing
+      const resetAt = parseRateLimitReset(msg);
+      if (resetAt) {
+        this._rateLimitResetAt = Math.max(this._rateLimitResetAt, resetAt);
+        this.queue.unclaim(job.id);
+        const resumeTime = new Date(resetAt).toLocaleTimeString();
+        console.log(chalk.yellow(`  ⚡ Rate limited on ${job.type}${job.project ? ` (${job.project})` : ''} — will resume at ${resumeTime}`));
+        // Notify session so it can pause the worker and schedule resume
+        this.onRateLimited?.(this._rateLimitResetAt);
+        this.eventLog.emit({
+          type: 'job.start', // reusing type since there's no 'job.ratelimited'
+          project: job.project ?? undefined,
+          summary: `Rate limited: ${job.type}${job.project ? ` for ${job.project}` : ''} — retry at ${resumeTime}`,
+        });
+      } else {
+        this.queue.fail(job.id, msg);
+        this.eventLog.emit({
+          type: 'job.failed',
+          project: job.project ?? undefined,
+          summary: `Job failed: ${job.type}${job.project ? ` for ${job.project}` : ''}: ${msg}`,
+        });
+      }
     } finally {
       this._activeJobs--;
       // Release any resource slots held by this job
@@ -368,7 +552,7 @@ export class Worker {
 
   private async executeRoadmapJob(job: Job): Promise<void> {
     const project = this.requireProject(job);
-    const projectPath = resolve(this.settings.workspaceRoot, project);
+    const projectPath = resolveProjectPath(this.settings, project);
     const architect = this.requireAgent('architect');
     const userDirection = job.metadata.userDirection as string | undefined;
 
@@ -390,7 +574,7 @@ export class Worker {
 
   private async executePlanJob(job: Job): Promise<void> {
     const project = this.requireProject(job);
-    const projectPath = resolve(this.settings.workspaceRoot, project);
+    const projectPath = resolveProjectPath(this.settings, project);
     const planner = this.requireAgent('planner');
 
     const roadmap = this.store.getRoadmap(project);
@@ -420,7 +604,6 @@ export class Worker {
 
     // Rather than running all items inline, post individual work-item jobs
     // so each one can be independently scheduled and parallelized by the worker.
-    let posted = 0;
     for (const item of actionable) {
       // Reset stuck items
       if (item.status === 'in-progress' || item.status === 'failed') {
@@ -431,7 +614,6 @@ export class Worker {
       this.queue.post('work-item', 'implementation', project, {
         workItemId: item.id,
       });
-      posted++;
     }
   }
 
@@ -520,9 +702,11 @@ export class Worker {
         dependsOnPRs:  (job.metadata.dependsOnPRs as number[] | undefined) ?? [],
         blocksPRs:     (job.metadata.blocksPRs as number[] | undefined) ?? [],
         uniqueHeadSha: (job.metadata.uniqueHeadSha as string | undefined) ?? '',
+        chainTipPR:    (job.metadata.chainTipPR as number | undefined),
+        chainMembers:  (job.metadata.chainMembers as number[] | undefined),
       };
 
-      const result = await runPRReviewStage(prReviewer, pr, this.settings.workspaceRoot);
+      const result = await runPRReviewStage(prReviewer, pr, this.settings.workspaceRoot, this.settings.projectsDir);
       await this.recordAgentCost();
 
       this.eventLog.emit({
@@ -542,22 +726,78 @@ export class Worker {
       //   approved or MAX_FIX_ROUNDS is hit.
       //
       // "REVIEW POSTED: changes-requested" → queue pr-fix (round 1+) or pause (round 0)
-      // "REVIEW POSTED: approved" → reviewer handles merge; nothing more to queue
+      // "REVIEW POSTED: approved" → auto-merge if self-authored, otherwise nothing
       // "REVIEW DEFERRED" → will be re-queued on next `forge review` run
       // "FAILED" / other → no follow-up
       const MAX_FIX_ROUNDS = 3;
       const output = result.output;
       const currentRound = (job.metadata.fixRound as number | undefined) ?? 0;
 
+      // Auto-merge: if approved AND we authored this PR, merge it.
+      // Self-authored PRs must never use `gh pr review` (GitHub rejects self-reviews).
+      // Instead we comment + merge directly.
+      if (/REVIEW POSTED:\s*approved/i.test(output)) {
+        try {
+          const isMergeable = await this.isSelfAuthoredAndMergeable(prNumber, repo);
+          if (isMergeable) {
+            execSync(
+              `gh pr merge ${prNumber} --repo ${repo} --squash --delete-branch`,
+              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+            );
+            console.log(chalk.green(`  ✓ PR #${prNumber} (${project}) auto-merged`));
+            this.eventLog.emit({
+              type: 'pr.merged',
+              project,
+              summary: `PR #${prNumber} auto-merged (self-authored, approved, CI passing)`,
+            });
+
+            // Chain consolidation: if this was a chain tip, close ancestor PRs.
+            // Their content is already included in the tip's branch, so merging
+            // the tip lands everything. Ancestor branches are now stale.
+            const ancestorPRs = (job.metadata.ancestorPRs as number[] | undefined) ?? [];
+            if (ancestorPRs.length > 0) {
+              this.closeAncestorPRs(ancestorPRs, repo, project, prNumber);
+            }
+
+            // Merge train: re-queue dependent PRs now that their parent merged.
+            // These PRs were previously deferred by the dependency gate.
+            // After the parent merges, GitHub updates their diff automatically —
+            // re-reviewing them now shows only their unique delta.
+            this.requeueDependentPRs(prNumber, repo, project, pr);
+          }
+        } catch (mergeErr) {
+          const mergeMsg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
+          console.log(chalk.yellow(`  PR #${prNumber} approved but merge failed: ${mergeMsg.slice(0, 100)}`));
+        }
+        return;
+      }
+
       if (/REVIEW POSTED:\s*changes-requested/i.test(output)) {
-        if (currentRound === 0) {
-          // First review — pause for human input
+        const userTriaged = job.metadata.userTriaged as boolean | undefined;
+
+        if (currentRound === 0 && !userTriaged) {
+          // First review without prior triage — pause for human input
           console.log(chalk.cyan(`  PR #${prNumber}: initial review posted. Waiting for your feedback before auto-fixing.`));
           console.log(chalk.dim(`    To start the autonomous fix loop: forge fix ${prNumber} --project ${project}`));
           this.eventLog.emit({
             type: 'review.complete',
             project,
             summary: `PR #${prNumber} initial review posted — paused for user feedback`,
+          });
+        } else if (currentRound === 0 && userTriaged) {
+          // User already triaged this PR via /review — auto-queue fix
+          const userFeedback = job.metadata.userFeedback as string | undefined;
+          const feedbackNote = userFeedback ? ` (with user feedback)` : '';
+          console.log(chalk.cyan(`  PR #${prNumber}: initial review posted — auto-fixing (user-triaged${feedbackNote})`));
+          this.queue.post('pr-fix', 'pr-fix' as JobPhase, project, {
+            ...job.metadata,
+            fixRound: 1,
+            lastReviewedSha: currentRemoteSha || undefined,
+          }, 12);
+          this.eventLog.emit({
+            type: 'review.complete',
+            project,
+            summary: `PR #${prNumber} initial review posted — auto-queued fix round 1 (user-triaged)`,
           });
         } else {
           const nextRound = currentRound + 1;
@@ -587,7 +827,7 @@ export class Worker {
     }
 
     // Bulk scan — scan all projects for open PRs and post individual review jobs
-    const openPRs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot);
+    const openPRs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot, this.settings.projectsDir);
     if (openPRs.length === 0) {
       this.eventLog.emit({ type: 'review.scan', summary: 'No open PRs found across managed projects' });
       return;
@@ -616,6 +856,122 @@ export class Worker {
     });
   }
 
+  /**
+   * Chain consolidation: close ancestor PRs after the chain tip merges.
+   * Their content was already included in the tip branch, so they're
+   * effectively merged. We close them with a comment explaining why.
+   */
+  private closeAncestorPRs(
+    ancestorPRs: number[],
+    repo: string,
+    project: string,
+    tipPrNumber: number,
+  ): void {
+    console.log(chalk.cyan(`  Chain consolidation: closing ${ancestorPRs.length} ancestor PR(s) (content landed via PR #${tipPrNumber})`));
+
+    for (const ancestorNum of ancestorPRs) {
+      try {
+        // Check if already closed/merged
+        const state = execSync(
+          `gh pr view ${ancestorNum} --repo ${repo} --json state --jq .state`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        ).trim();
+
+        if (state !== 'OPEN') {
+          console.log(chalk.dim(`    PR #${ancestorNum}: already ${state.toLowerCase()}`));
+          continue;
+        }
+
+        // Comment explaining the closure, then close
+        const comment = `Closing: this PR's content was included in the consolidated chain tip PR #${tipPrNumber}, which has been merged. All changes from this branch were landed as part of that merge.`;
+        execSync(
+          `gh pr comment ${ancestorNum} --repo ${repo} --body "${comment}"`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        execSync(
+          `gh pr close ${ancestorNum} --repo ${repo} --delete-branch`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+
+        console.log(chalk.dim(`    PR #${ancestorNum}: closed (content in #${tipPrNumber})`));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(chalk.yellow(`    PR #${ancestorNum}: failed to close — ${msg.slice(0, 80)}`));
+      }
+    }
+
+    this.eventLog.emit({
+      type: 'pr.chain.closed',
+      project,
+      summary: `Chain consolidation: closed ${ancestorPRs.length} ancestor PR(s) after tip PR #${tipPrNumber} merged`,
+    });
+  }
+
+  /**
+   * Merge train: after a PR merges, re-queue review jobs for any PRs
+   * that were waiting on it. This unblocks the dependency chain so
+   * stacked branches get reviewed and merged in layer order automatically.
+   */
+  private requeueDependentPRs(
+    mergedPrNumber: number,
+    repo: string,
+    project: string,
+    mergedPr: { blocksPRs: number[] },
+  ): void {
+    const dependentPRs = mergedPr.blocksPRs;
+    if (dependentPRs.length === 0) return;
+
+    console.log(chalk.cyan(`  Merge train: PR #${mergedPrNumber} merged, re-queuing ${dependentPRs.length} dependent PR(s)`));
+
+    for (const depPrNumber of dependentPRs) {
+      try {
+        // Fetch current metadata for the dependent PR
+        const raw = execSync(
+          `gh pr view ${depPrNumber} --repo ${repo} --json number,title,url,headRefName,state`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        const depPr = JSON.parse(raw) as {
+          number: number;
+          title: string;
+          url: string;
+          headRefName: string;
+          state: string;
+        };
+
+        // Skip if already merged/closed
+        if (depPr.state !== 'OPEN') {
+          console.log(chalk.dim(`    PR #${depPrNumber}: already ${depPr.state.toLowerCase()} — skipping`));
+          continue;
+        }
+
+        // Queue a review job for this now-unblocked PR
+        this.queue.post('review', 'review' as JobPhase, project, {
+          prNumber: depPr.number,
+          prTitle: depPr.title,
+          prUrl: depPr.url,
+          branch: depPr.headRefName,
+          repo,
+          project,
+          mergeLayer: 0, // Recalculated on next full scan; safe to set 0 since parent merged
+          dependsOnPRs: [],
+          blocksPRs: [],
+          uniqueHeadSha: '',
+        }, 6); // Slightly lower priority than foundation (5) so new scans take precedence
+
+        console.log(chalk.dim(`    PR #${depPrNumber}: queued for review (${depPr.title})`));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(chalk.yellow(`    PR #${depPrNumber}: failed to re-queue — ${msg.slice(0, 80)}`));
+      }
+    }
+
+    this.eventLog.emit({
+      type: 'review.scan',
+      project,
+      summary: `Merge train: PR #${mergedPrNumber} merged, re-queued ${dependentPRs.length} dependent PR(s)`,
+    });
+  }
+
   private async executePrFixJob(job: Job): Promise<void> {
     const developer = this.requireAgent('developer');
     const prNumber = job.metadata.prNumber as number | undefined;
@@ -628,7 +984,7 @@ export class Worker {
 
     const branch = job.metadata.branch as string ?? '';
     const fixRound = (job.metadata.fixRound as number | undefined) ?? 1;
-    const projectPath = resolve(this.settings.workspaceRoot, project);
+    const projectPath = resolveProjectPath(this.settings, project);
 
     // Use a temporary git worktree so we don't pollute the main checkout.
     // This prevents the dirty-state problem where one fixer's uncommitted
@@ -651,11 +1007,34 @@ export class Worker {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       useWorktree = true;
-    } catch (err) {
+    } catch {
       console.log(chalk.yellow(`  Worktree creation failed for PR #${prNumber}, falling back to main checkout`));
     }
 
     const fixCwd = useWorktree ? worktreeDir : projectPath;
+
+    const userFeedback = job.metadata.userFeedback as string | undefined;
+    const userFeedbackBlock = userFeedback ? `
+## User Direction (from triage)
+
+The user provided this feedback during interactive triage — prioritise it:
+
+> ${userFeedback}
+
+` : '';
+
+    const isChainTip = job.metadata.isChainTip as boolean | undefined;
+    const ancestorPRs = (job.metadata.ancestorPRs as number[] | undefined) ?? [];
+    const chainBlock = isChainTip ? `
+## Chain Consolidation Context
+
+This is the **tip PR of a ${ancestorPRs.length + 1}-PR chain**. Your branch contains
+all commits from ancestor PRs: ${ancestorPRs.map((n) => `#${n}`).join(', ')}.
+After this PR is approved and merged, those ancestor PRs will be closed automatically.
+
+Fix ALL issues across the entire chain's codebase, not just this PR's unique delta.
+The goal is to get this branch into a mergeable, approved state that lands everything.
+` : '';
 
     const prompt = `You are fixing PR #${prNumber} in ${repo} (fix round ${fixRound}).
 
@@ -664,7 +1043,7 @@ export class Worker {
 - Repo: ${repo}
 - Project: ${project}
 - Fix round: ${fixRound}
-
+${userFeedbackBlock}${chainBlock}
 ## Your Task
 
 1. Check for merge conflicts or branch issues FIRST:
@@ -789,6 +1168,11 @@ Your final line MUST be one of:
     const workItem = this.store.getWorkItem(workItemId);
     if (!workItem) throw new Error(`Work item not found: ${workItemId}`);
 
+    // Skip items that are already done or blocked
+    if (workItem.status === 'completed' || workItem.status === 'blocked') {
+      return;
+    }
+
     // Check dependencies before executing
     const deps = workItem.dependsOn ?? [];
     if (deps.length > 0) {
@@ -796,15 +1180,11 @@ Your final line MUST be one of:
       const completedIds = new Set(allItems.filter((i) => i.status === 'completed').map((i) => i.id));
       const unmet = deps.filter((dep) => !completedIds.has(dep));
       if (unmet.length > 0) {
-        // Re-queue with a small delay (higher priority number = later)
-        this.queue.post('work-item', 'implementation', workItem.project, {
-          workItemId,
-        }, (job.priority ?? 35) + 1);
-        return;
+        throw new JobDeferred(`Waiting on: ${unmet.map(d => d.split('/').pop()).join(', ')}`);
       }
     }
 
-    const projectPath = resolve(this.settings.workspaceRoot, workItem.project);
+    const projectPath = resolveProjectPath(this.settings, workItem.project);
     await this.runWorkItemPipeline(workItem, projectPath);
   }
 
@@ -904,6 +1284,194 @@ Your final line MUST be one of:
   // ═══════════════════════════════════════════════════════════════════
   // Internal: Helpers
   // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if a PR was authored by us (the GitHub authenticated user) and is
+   * in a mergeable state (CI passing, no conflicts). Only self-authored PRs
+   * should be auto-merged — we must never `gh pr review` our own PRs.
+   */
+  private async isSelfAuthoredAndMergeable(prNumber: number, repo: string): Promise<boolean> {
+    try {
+      const json = execSync(
+        `gh pr view ${prNumber} --repo ${repo} --json author,mergeable,mergeStateStatus,statusCheckRollup`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      ).trim();
+      const pr = JSON.parse(json) as {
+        author: { login: string };
+        mergeable: string;
+        mergeStateStatus: string;
+        statusCheckRollup?: Array<{ conclusion: string }>;
+      };
+
+      // Get the current authenticated user
+      const currentUser = execSync('gh api user --jq .login', {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+
+      if (pr.author.login !== currentUser) return false;
+      if (pr.mergeable !== 'MERGEABLE') return false;
+
+      // Check CI — all checks must pass (or no checks configured)
+      const checks = pr.statusCheckRollup ?? [];
+      const hasFailures = checks.some((c) => c.conclusion === 'FAILURE' || c.conclusion === 'ERROR');
+      if (hasFailures) return false;
+
+      // mergeStateStatus must be CLEAN or UNSTABLE (warnings-only)
+      if (pr.mergeStateStatus !== 'CLEAN' && pr.mergeStateStatus !== 'UNSTABLE') return false;
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Heartbeat — autonomous cycle continuation (daemon mode only)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Heartbeat runs between job batches in daemon mode. It closes the
+   * autonomous loop by:
+   * 1. Detecting merged PRs and completing their work items
+   * 2. Retrying failed work items (with a cap to prevent infinite retries)
+   * 3. Queueing newly-unblocked work items
+   *
+   * Without this, the worker drains its queue and sits idle even though
+   * merged PRs have unblocked downstream work.
+   */
+  private async heartbeat(): Promise<void> {
+    const { scanOpenPRs } = await import('../workflow/stages/review-prs.js');
+
+    // 1. Sync merged PRs → complete work items
+    let mergedCount = 0;
+    for (const project of this.settings.projects) {
+      const items = this.store.getWorkItemsByProject(project);
+      const reviewItems = items.filter(
+        (i) => i.stage === 'review' && i.status !== 'completed',
+      );
+
+      for (const item of reviewItems) {
+        // If a work item is in review stage but its PR was merged, mark it done.
+        const prOutput = item.stageOutputs.pr;
+        const prUrl = prOutput?.summary?.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
+        if (!prUrl) continue;
+
+        const prNumber = parseInt(prUrl[1], 10);
+        const projectPath = resolveProjectPath(this.settings, project);
+        try {
+          const state = execSync(
+            `gh pr view ${prNumber} --json state --jq .state`,
+            { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          ).trim();
+
+          if (state === 'MERGED') {
+            item.status = 'completed';
+            item.stage = 'review';
+            item.updatedAt = new Date().toISOString();
+            this.store.saveWorkItem(item);
+            mergedCount++;
+          }
+        } catch { /* can't check — skip */ }
+      }
+    }
+
+    if (mergedCount > 0) {
+      console.log(chalk.green(`  ♻ Heartbeat: ${mergedCount} work item(s) completed (PR merged)`));
+      this.eventLog.emit({
+        type: 'heartbeat.sync',
+        summary: `Synced ${mergedCount} merged PR(s) → work items completed`,
+      });
+    }
+
+    // 2. Auto-merge self-authored PRs that are ready
+    const openPRs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot, this.settings.projectsDir);
+    let autoMerged = 0;
+    for (const pr of openPRs) {
+      try {
+        const isMergeable = await this.isSelfAuthoredAndMergeable(pr.number, pr.repo);
+        if (isMergeable && pr.dependsOnPRs.length === 0) {
+          execSync(
+            `gh pr merge ${pr.number} --repo ${pr.repo} --squash --delete-branch`,
+            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          );
+          console.log(chalk.green(`  ✓ Heartbeat: auto-merged PR #${pr.number} (${pr.project})`));
+          autoMerged++;
+        }
+      } catch { /* merge failed — will retry next heartbeat */ }
+    }
+    if (autoMerged > 0) {
+      this.eventLog.emit({
+        type: 'heartbeat.merge',
+        summary: `Auto-merged ${autoMerged} self-authored PR(s)`,
+      });
+    }
+
+    // 3. Retry failed work items (max 2 retries tracked via blockReason)
+    const MAX_RETRIES = 2;
+    let retriedCount = 0;
+    for (const project of this.settings.projects) {
+      const items = this.store.getWorkItemsByProject(project);
+      const failed = items.filter((i) => i.status === 'failed');
+
+      for (const item of failed) {
+        const retryCount = (item.blockReason?.match(/\[retry (\d+)\]/)?.[1] ?? '0');
+        const retries = parseInt(retryCount, 10);
+        if (retries >= MAX_RETRIES) continue;
+
+        item.status = 'pending';
+        item.blockReason = `[retry ${retries + 1}] ${item.blockReason ?? ''}`.trim();
+        item.updatedAt = new Date().toISOString();
+        this.store.saveWorkItem(item);
+        retriedCount++;
+      }
+    }
+    if (retriedCount > 0) {
+      console.log(chalk.yellow(`  ♻ Heartbeat: reset ${retriedCount} failed work item(s) for retry`));
+      this.eventLog.emit({
+        type: 'heartbeat.retry',
+        summary: `Reset ${retriedCount} failed work item(s) for retry`,
+      });
+    }
+
+    // 4. Queue newly-unblocked work items
+    let queuedCount = 0;
+    for (const project of this.settings.projects) {
+      const items = this.store.getWorkItemsByProject(project);
+      const completedIds = new Set(
+        items.filter((i) => i.status === 'completed').map((i) => i.id),
+      );
+      const actionable = items.filter(
+        (i) => i.status === 'pending' && i.stage !== 'review',
+      );
+
+      for (const item of actionable) {
+        const deps = item.dependsOn ?? [];
+        const allDepsMet = deps.length === 0 || deps.every((d) => completedIds.has(d));
+        if (!allDepsMet) continue;
+
+        // Check if a work-item job already exists for this item
+        const existing = this.queue.all().find(
+          (j) => j.type === 'work-item'
+            && j.metadata.workItemId === item.id
+            && (j.status === 'queued' || j.status === 'running'),
+        );
+        if (existing) continue;
+
+        this.queue.post('work-item', 'implementation', project, {
+          workItemId: item.id,
+        });
+        queuedCount++;
+      }
+    }
+    if (queuedCount > 0) {
+      console.log(chalk.blue(`  ♻ Heartbeat: queued ${queuedCount} newly-unblocked work item(s)`));
+      this.eventLog.emit({
+        type: 'heartbeat.queue',
+        summary: `Queued ${queuedCount} unblocked work item(s)`,
+      });
+    }
+  }
 
   private requireAgent(role: AgentRole): AgentDefinition {
     const agent = this.agents.get(role);

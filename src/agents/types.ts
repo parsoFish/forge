@@ -51,6 +51,9 @@ export interface AgentResult {
 
   /** Escalation reason (if escalate is true) */
   readonly escalateReason?: string;
+
+  /** If the run failed due to rate limiting, the estimated reset time (ms epoch) */
+  readonly rateLimitResetAt?: number;
 }
 
 export interface AgentInvocation {

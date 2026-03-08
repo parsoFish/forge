@@ -11,6 +11,7 @@
  */
 
 import { cpus, freemem, totalmem, loadavg } from 'node:os';
+import { readFileSync } from 'node:fs';
 
 /**
  * Resource slot definitions — named finite-capacity locks for heavyweight
@@ -31,6 +32,13 @@ export interface ResourceThresholds {
   readonly maxLoadFactor: number;
   /** Max percentage of memory used (0-1). 0.85 = 85% */
   readonly maxMemoryUsage: number;
+  /**
+   * Minimum available memory (MB) required before spawning another agent.
+   * Acts as an absolute floor — even if percentage looks fine, refuse to
+   * spawn if available memory is below this. Each Claude Code agent can
+   * consume 1-2GB, so this prevents OOM on memory-constrained systems.
+   */
+  readonly minAvailableMemoryMb: number;
   /** Cooldown in ms between health checks to avoid thrashing */
   readonly checkIntervalMs: number;
   /** Named resource slots with capacity limits */
@@ -58,9 +66,10 @@ export const DEFAULT_RESOURCE_SLOTS: Readonly<Record<string, ResourceSlotConfig>
 };
 
 export const DEFAULT_THRESHOLDS: ResourceThresholds = {
-  maxLoadFactor: 0.80,      // Don't exceed 80% of cores
-  maxMemoryUsage: 0.85,     // Leave 15% memory headroom
-  checkIntervalMs: 5000,    // Check every 5s at most
+  maxLoadFactor: 0.80,          // Don't exceed 80% of cores
+  maxMemoryUsage: 0.85,         // Leave 15% memory headroom
+  minAvailableMemoryMb: 1500,   // Need at least 1.5GB free to spawn another agent
+  checkIntervalMs: 5000,        // Check every 5s at most
   resourceSlots: DEFAULT_RESOURCE_SLOTS,
 };
 
@@ -92,6 +101,29 @@ export interface TuningReport {
   readonly healthySamples: number;
   readonly totalSamples: number;
   readonly slotMetrics: Readonly<Record<string, SlotMetrics>>;
+}
+
+/**
+ * Get available memory in bytes using the most accurate source.
+ *
+ * On Linux, reads MemAvailable from /proc/meminfo — this accounts for
+ * reclaimable page cache and buffers, giving a much more accurate picture
+ * than os.freemem() which only returns MemFree (excludes reclaimable cache).
+ *
+ * Falls back to os.freemem() on non-Linux systems or if /proc/meminfo
+ * can't be read.
+ */
+function getAvailableMemoryBytes(): number {
+  try {
+    const meminfo = readFileSync('/proc/meminfo', 'utf-8');
+    const match = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+    if (match) {
+      return parseInt(match[1], 10) * 1024; // kB → bytes
+    }
+  } catch {
+    // Not Linux or /proc/meminfo not readable — fall through
+  }
+  return freemem();
 }
 
 export class ResourceMonitor {
@@ -223,10 +255,10 @@ export class ResourceMonitor {
     const cpuLoadFactor = load1min / coreCount;
 
     const totalMem = totalmem();
-    const freeMem = freemem();
-    const usedMem = totalMem - freeMem;
+    const availableBytes = getAvailableMemoryBytes();
+    const usedMem = totalMem - availableBytes;
     const memoryUsagePercent = usedMem / totalMem;
-    const availableMemoryMb = Math.round(freeMem / (1024 * 1024));
+    const availableMemoryMb = Math.round(availableBytes / (1024 * 1024));
 
     const slots = this.slotSnapshot();
 
@@ -254,6 +286,12 @@ export class ResourceMonitor {
       healthy = false;
       const memReason = `Memory usage too high: ${(memoryUsagePercent * 100).toFixed(0)}% (${availableMemoryMb}MB free, limit: ${(this.thresholds.maxMemoryUsage * 100).toFixed(0)}%)`;
       reason = reason ? `${reason}; ${memReason}` : memReason;
+    }
+
+    if (availableMemoryMb < this.thresholds.minAvailableMemoryMb) {
+      healthy = false;
+      const floorReason = `Available memory too low: ${availableMemoryMb}MB (minimum: ${this.thresholds.minAvailableMemoryMb}MB)`;
+      reason = reason ? `${reason}; ${floorReason}` : floorReason;
     }
 
     // Check if any slot is at capacity — flag as unhealthy so the worker
