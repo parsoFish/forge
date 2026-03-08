@@ -68,61 +68,30 @@ class QueuePane {
 
     process.stdout.write('\x1b[H\x1b[2J');
 
-    console.log(chalk.bold(' JOB QUEUE') + chalk.dim(`  (${this.jobs.length} active)`));
-    console.log(chalk.dim(' ─'.repeat(30)));
+    const w = process.stdout.columns ?? 30;
+    const lineW = Math.min(w - 2, 35);
+
+    console.log(chalk.bold(' QUEUE') + chalk.dim(` ${this.jobs.length}`));
+    console.log(chalk.dim(' ' + '─'.repeat(lineW)));
 
     if (this.jobs.length === 0) {
-      console.log();
-      console.log(chalk.dim('  No active jobs.'));
-      console.log();
-      console.log(chalk.dim('  Queue work with: forge roadmap, forge implement, etc.'));
+      console.log(chalk.dim('  Empty'));
       return;
     }
-
-    // Header
-    console.log(chalk.dim('  St  Pri  Type            Project          Age'));
-    console.log(chalk.dim('  ' + '─'.repeat(55)));
 
     for (let i = 0; i < this.jobs.length; i++) {
       const job = this.jobs[i];
       const selected = i === this.selectedIndex;
       const icon = STATUS_ICON[job.status] ?? '?';
-      const pri = String(job.priority).padStart(3);
-      const type = truncate(job.type, 15).padEnd(15);
-      const project = truncate(job.project ?? '—', 16).padEnd(16);
+      const type = truncate(job.type, 8);
+      const project = truncate(job.project ?? '—', 10);
       const age = formatAge(job.startedAt ?? job.createdAt);
 
-      const line = `  ${icon}  ${pri}  ${type} ${project} ${age}`;
+      const line = ` ${icon} ${type} ${project} ${age}`;
       console.log(selected ? chalk.bgWhite.black(line) : line);
-
-      // Show dependencies if any
-      const deps = job.metadata?.dependsOnPRs as number[] | undefined;
-      if (deps && deps.length > 0) {
-        const depLine = `       └─ depends: ${deps.map((n) => `PR#${n}`).join(', ')}`;
-        console.log(chalk.dim(depLine));
-      }
     }
 
-    // Recent completed (last 5)
-    const recent = this.queue.all()
-      .filter((j) => j.status === 'completed' || j.status === 'failed')
-      .sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''))
-      .slice(0, 5);
-
-    if (recent.length > 0) {
-      console.log();
-      console.log(chalk.dim('  Recent:'));
-      for (const job of recent) {
-        const icon = STATUS_ICON[job.status] ?? '?';
-        const type = truncate(job.type, 15).padEnd(15);
-        const project = truncate(job.project ?? '—', 12);
-        console.log(chalk.dim(`  ${icon}  ${type} ${project}`));
-      }
-    }
-
-    // Controls
-    console.log();
-    console.log(chalk.dim('  ↑/↓ select  +/- priority  q quit'));
+    console.log(chalk.dim(' ↑↓ +/- q'));
   }
 
   handleKey(key: Buffer): void {

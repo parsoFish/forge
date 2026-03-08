@@ -11,22 +11,18 @@
     "researcher": "claude-haiku-4-5-20251001",
     "reflector": "claude-sonnet-4-6"
   },
-  "budget": {
+  "concurrency": {
+    "ceiling": 6,
+    "targetCpuLoad": 0.65,
+    "criticalCpuLoad": 0.85,
+    "memoryPerAgentMb": 800
+  },
+  "resourceSlots": {
+    "build": { "capacity": 3 }
+  },
+  "costTracking": {
     "maxRunBudgetUsd": 500,
     "maxWeeklyBudgetUsd": 2000,
     "warnAtPercent": 75
-  },
-  "maxConcurrency": 4,
-  "phaseConcurrency": {
-    "designPlan": 4,
-    "test": 2,
-    "develop": 3,
-    "prReview": 4
-  },
-  "resourceThresholds": {
-    "minAvailableMemoryMb": 2000,
-    "resourceSlots": {
-      "build": { "capacity": 3 }
-    }
   }
 }

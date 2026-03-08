@@ -21,9 +21,9 @@ import { loadSettings, resolveProjectPath, type ForgeSettings } from './config/i
 import { StateStore } from './state/index.js';
 import { EventLog } from './events/index.js';
 import { BudgetTracker } from './budget/index.js';
-import { ResourceMonitor } from './monitor/index.js';
+import { ResourceMonitor, DEFAULT_THRESHOLDS } from './monitor/index.js';
 import { JobQueue } from './jobs/index.js';
-import type { WorkflowStage, OrchestratorPhase } from './workflow/types.js';
+import type { OrchestratorPhase } from './workflow/types.js';
 
 export class Orchestrator {
   private readonly settings: ForgeSettings;
@@ -40,8 +40,11 @@ export class Orchestrator {
 
     this.store = new StateStore(this.settings.workspaceRoot);
     this.eventLog = new EventLog(forgeRoot);
-    this.budget = new BudgetTracker(forgeRoot, this.settings.budget);
-    this.resources = new ResourceMonitor(this.settings.resourceThresholds);
+    this.budget = new BudgetTracker(forgeRoot, this.settings.costTracking);
+    this.resources = new ResourceMonitor({
+      ...DEFAULT_THRESHOLDS,
+      resourceSlots: this.settings.resourceSlots,
+    });
     this.queue = new JobQueue(forgeRoot);
     this.agents = loadAgents(this.settings);
 
@@ -819,8 +822,7 @@ export class Orchestrator {
     if (Object.keys(summary.byStage).length > 0) {
       console.log(chalk.bold('  By Stage:'));
       for (const [stage, count] of Object.entries(summary.byStage)) {
-        const limit = this.getPhaseLimitForStage(stage as WorkflowStage);
-        console.log(`    ${stage}: ${count} (max ${limit} concurrent)`);
+        console.log(`    ${stage}: ${count}`);
       }
       console.log();
     }
@@ -888,24 +890,6 @@ export class Orchestrator {
   // ═══════════════════════════════════════════════════════════════════
   // Internal Helpers
   // ═══════════════════════════════════════════════════════════════════
-
-  private getPhaseLimitForStage(stage: WorkflowStage): number {
-    const pc = this.settings.phaseConcurrency;
-    switch (stage) {
-      case 'design':
-      case 'plan':
-        return pc.designPlan;
-      case 'test':
-        return pc.test;
-      case 'develop':
-        return pc.develop;
-      case 'pr':
-      case 'review':
-        return pc.prReview;
-      default:
-        return this.settings.maxConcurrency;
-    }
-  }
 
   private requireAgent(role: AgentRole): AgentDefinition {
     const agent = this.agents.get(role);

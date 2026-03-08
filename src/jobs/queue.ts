@@ -154,6 +154,23 @@ export class JobQueue {
   }
 
   /**
+   * Claim a specific queued job by ID — used when the dispatch loop
+   * needs to skip past blocked jobs and claim an eligible one deeper
+   * in the queue.
+   *
+   * Returns null if the job doesn't exist or isn't in 'queued' state.
+   */
+  claimById(id: string): Job | null {
+    const job = this.get(id);
+    if (!job || job.status !== 'queued') return null;
+
+    job.status = 'running';
+    job.startedAt = new Date().toISOString();
+    this.save(job);
+    return job;
+  }
+
+  /**
    * Put a claimed (running) job back in the queue.
    * Used when a job can't start due to resource slot limits.
    */

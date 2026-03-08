@@ -2,11 +2,11 @@
  * Rolling actions pane — live agent activity display.
  *
  * Tails `.forge/events.jsonl` and shows:
- *   - One line per running agent (updates in place)
- *   - Completed job summaries
+ *   - One live-updating line per running agent
+ *   - 3 recent completion summaries with commit-style messages
  *
  * Format per running agent:
- *   [role] current action — output excerpt — 2m30s
+ *   [role] project — action — output — 2m30s
  *
  * WHY tail events instead of reading job files:
  * Events contain agent.spawn, agent.output, agent.result — the full
@@ -21,7 +21,7 @@ import { loadSettings } from '../config/index.js';
 import type { ForgeEvent } from '../events/event-log.js';
 
 const REFRESH_MS = 2_000;
-const MAX_COMPLETED = 8;
+const MAX_COMPLETED = 3;
 
 interface ActiveAgent {
   runId: string;
@@ -37,6 +37,7 @@ interface CompletedEntry {
   project?: string;
   summary: string;
   completedAt: number;
+  durationMs: number;
 }
 
 class ActionsPane {
@@ -44,6 +45,7 @@ class ActionsPane {
   private lastFileSize = 0;
   private readonly activeAgents = new Map<string, ActiveAgent>();
   private readonly completed: CompletedEntry[] = [];
+  private termWidth = 40;
 
   constructor(forgeRoot: string) {
     this.eventsPath = resolve(forgeRoot, 'events.jsonl');
@@ -120,28 +122,32 @@ class ActionsPane {
           break;
 
         case 'agent.result':
-        case 'agent.error':
+        case 'agent.error': {
           if (runId && this.activeAgents.has(runId)) {
             const agent = this.activeAgents.get(runId)!;
+            const durationMs = Date.now() - agent.startedAt;
             this.completed.unshift({
               role: agent.role,
               project: agent.project,
-              summary: event.summary.slice(0, 100),
+              summary: this.buildCompletionSummary(event),
               completedAt: Date.now(),
+              durationMs,
             });
             if (this.completed.length > MAX_COMPLETED) this.completed.pop();
             this.activeAgents.delete(runId);
           }
           break;
+        }
 
         case 'job.complete':
         case 'job.failed': {
-          const status = event.type === 'job.complete' ? chalk.green('✓') : chalk.red('✗');
+          const status = event.type === 'job.complete' ? chalk.green('done') : chalk.red('fail');
           this.completed.unshift({
-            role: event.data?.type as string ?? 'job',
+            role: event.data?.jobType as string ?? 'job',
             project: event.project,
-            summary: `${status} ${event.summary.slice(0, 90)}`,
+            summary: `${status}: ${event.summary.slice(0, 80)}`,
             completedAt: Date.now(),
+            durationMs: (event.data?.durationMs as number) ?? 0,
           });
           if (this.completed.length > MAX_COMPLETED) this.completed.pop();
           break;
@@ -160,6 +166,25 @@ class ActionsPane {
     }
   }
 
+  /**
+   * Build a commit-style summary from an agent result event.
+   * Extracts the meaningful outcome from the agent's output.
+   */
+  private buildCompletionSummary(event: ForgeEvent): string {
+    const raw = event.summary ?? '';
+
+    // Look for structured output lines (FIX PUSHED, REVIEW POSTED, etc.)
+    const structured = raw.match(/(FIX PUSHED|FIX BLOCKED|FIX SKIPPED|REVIEW POSTED|FAILED|MERGED|APPROVED|CHANGES REQUESTED)[:\s]*(.*)/i);
+    if (structured) {
+      const [, action, detail] = structured;
+      return `${action.toLowerCase()}: ${detail.slice(0, 60)}`;
+    }
+
+    // Fall back to first meaningful line
+    const firstLine = raw.split('\n').find(l => l.trim().length > 10) ?? raw;
+    return firstLine.slice(0, 80);
+  }
+
   private formatDuration(startMs: number): string {
     const sec = Math.floor((Date.now() - startMs) / 1000);
     if (sec < 60) return `${sec}s`;
@@ -168,50 +193,64 @@ class ActionsPane {
     return `${min}m${remSec.toString().padStart(2, '0')}s`;
   }
 
+  private formatDurationMs(ms: number): string {
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60) return `${sec}s`;
+    const min = Math.floor(sec / 60);
+    return `${min}m`;
+  }
+
+  private truncate(s: string, max: number): string {
+    return s.length > max ? s.slice(0, max - 1) + '…' : s;
+  }
+
   render(): void {
     const events = this.readNewEvents();
     this.processEvents(events);
 
+    // Detect available width for content truncation
+    this.termWidth = process.stdout.columns ?? 40;
+    const contentWidth = this.termWidth - 4; // 2 indent + 2 margin
+
     process.stdout.write('\x1b[H\x1b[2J');
 
-    console.log(chalk.bold(' ACTIONS') + chalk.dim(`  (${this.activeAgents.size} running)`));
-    console.log(chalk.dim(' ─'.repeat(30)));
+    console.log(chalk.bold(' AGENTS') + chalk.dim(`  ${this.activeAgents.size} running`));
+    console.log(chalk.dim(' ' + '─'.repeat(Math.min(contentWidth, 35))));
 
     if (this.activeAgents.size === 0 && this.completed.length === 0) {
-      console.log();
-      console.log(chalk.dim('  No agent activity.'));
-      console.log(chalk.dim('  Agents will appear here when the worker processes jobs.'));
+      console.log(chalk.dim('  Waiting for agents...'));
       return;
     }
 
-    // Active agents — one line each, updating in place
-    if (this.activeAgents.size > 0) {
-      console.log();
-      for (const agent of this.activeAgents.values()) {
-        const role = chalk.cyan(`[${agent.role}]`);
-        const project = agent.project ? chalk.dim(` ${agent.project}`) : '';
-        const duration = chalk.dim(this.formatDuration(agent.startedAt));
-        const action = agent.lastAction;
-        const output = agent.lastOutput ? chalk.dim(` — ${agent.lastOutput.slice(0, 50)}`) : '';
+    // Active agents — one live-updating line per agent
+    // Each agent gets 2 lines: identity + current activity
+    for (const agent of this.activeAgents.values()) {
+      const role = chalk.cyan(`[${agent.role}]`);
+      const project = agent.project ? ` ${chalk.white(agent.project)}` : '';
+      const duration = chalk.yellow(this.formatDuration(agent.startedAt));
 
-        console.log(`  ${role}${project} ${action}${output} ${duration}`);
-      }
+      // Line 1: role, project, duration
+      console.log(`  ${role}${project} ${chalk.dim('—')} ${duration}`);
+
+      // Line 2: current action + output (indented)
+      const action = this.truncate(agent.lastAction, contentWidth - 4);
+      const output = agent.lastOutput
+        ? chalk.dim(this.truncate(agent.lastOutput, contentWidth - action.length - 6))
+        : '';
+      console.log(chalk.dim(`    ${action}`) + (output ? ` ${output}` : ''));
     }
 
-    // Completed jobs summary
+    // Completed — 3 recent with commit-style summaries
     if (this.completed.length > 0) {
-      console.log();
-      console.log(chalk.dim('  Recent completions:'));
+      if (this.activeAgents.size > 0) console.log(); // spacer
+      console.log(chalk.dim('  Recent:'));
       for (const entry of this.completed) {
         const project = entry.project ? chalk.dim(`${entry.project} `) : '';
-        const age = this.formatDuration(entry.completedAt);
-        console.log(chalk.dim(`  ${project}${entry.summary} (${age} ago)`));
+        const dur = this.formatDurationMs(entry.durationMs);
+        const summary = this.truncate(entry.summary, contentWidth - 12);
+        console.log(`  ${project}${chalk.dim(summary)} ${chalk.dim(`(${dur})`)}`);
       }
     }
-
-    // Footer
-    console.log();
-    console.log(chalk.dim(`  Updated: ${new Date().toLocaleTimeString()}`));
   }
 
   start(): void {

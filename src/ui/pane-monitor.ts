@@ -87,8 +87,10 @@ function render(forgeRoot: string): void {
     console.log(chalk.dim('  Slots ') + slotStr);
   }
 
-  // Cost — informational only (subscription is the real cap)
-  console.log(chalk.dim('  Cost  ') + status.budget.summary);
+  // API-equivalent cost — does NOT reflect actual plan usage.
+  // Subscriptions meter by tokens/requests, not dollars.
+  console.log(chalk.dim('  API~  ') + chalk.dim(status.budget.summary));
+  console.log(chalk.dim('        ') + chalk.dim.italic('est. cost, not plan usage'));
 }
 
 export function startMonitorPane(workspaceRoot?: string): void {

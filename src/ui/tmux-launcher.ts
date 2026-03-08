@@ -83,22 +83,35 @@ export function launchUI(): void {
 
   const forgeCmd = resolveForgeCmd();
 
-  // Build tmux commands to create the layout
+  // Layout designed for 80x24 minimum. Right column splits are sized
+  // so actions (the "star") gets the most space, queue and monitor
+  // are compact. All panes render bottom-up to minimize height needs.
+  //
+  //   ┌────────────────────────┬──────────────────┐
+  //   │                        │   Queue (~5 rows) │
+  //   │  Forge Orchestrator    ├──────────────────┤
+  //   │  (interactive session) │   Actions (~13)   │
+  //   │                        ├──────────────────┤
+  //   │                        │   Monitor (~6)    │
+  //   └────────────────────────┴──────────────────┘
   const commands = [
     // Create session with the main orchestrator pane (interactive REPL)
-    `tmux new-session -d -s ${SESSION_NAME} -x 200 -y 50 '${forgeCmd} session'`,
+    `tmux new-session -d -s ${SESSION_NAME} '${forgeCmd} session'`,
 
-    // Split right column (40% width)
-    `tmux split-window -h -t ${SESSION_NAME} -l 40% '${forgeCmd} watch:queue'`,
+    // Split right column (35% width — gives orchestrator more room)
+    `tmux split-window -h -t ${SESSION_NAME} -l 35% '${forgeCmd} watch:queue'`,
 
-    // Split right column into 3 rows: queue (top), actions (middle), monitor (bottom)
-    `tmux split-window -v -t ${SESSION_NAME}:0.1 -l 66% '${forgeCmd} watch:actions'`,
-    `tmux split-window -v -t ${SESSION_NAME}:0.2 -l 50% '${forgeCmd} watch:monitor'`,
+    // Split right column: queue keeps top ~5 lines, actions+monitor get rest.
+    // 78% of right column goes to actions+monitor, 22% stays as queue.
+    `tmux split-window -v -t ${SESSION_NAME}:0.1 -l 78% '${forgeCmd} watch:actions'`,
+
+    // Split bottom of right column: monitor gets ~6 lines (33% of remaining)
+    `tmux split-window -v -t ${SESSION_NAME}:0.2 -l 33% '${forgeCmd} watch:monitor'`,
 
     // Focus the main orchestrator pane
     `tmux select-pane -t ${SESSION_NAME}:0.0`,
 
-    // Set pane borders for visibility
+    // Minimal pane borders
     `tmux set -t ${SESSION_NAME} pane-border-style 'fg=colour238'`,
     `tmux set -t ${SESSION_NAME} pane-active-border-style 'fg=colour39'`,
   ];

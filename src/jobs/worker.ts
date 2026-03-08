@@ -29,7 +29,7 @@ import { loadSettings, resolveProjectPath, type ForgeSettings } from '../config/
 import { StateStore } from '../state/index.js';
 import { EventLog } from '../events/index.js';
 import { BudgetTracker } from '../budget/index.js';
-import { ResourceMonitor } from '../monitor/index.js';
+import { ResourceMonitor, DEFAULT_THRESHOLDS } from '../monitor/index.js';
 import { AdaptiveConcurrency } from '../monitor/adaptive-concurrency.js';
 import { ResourceProfiler, type ResourceObservation } from '../monitor/resource-profiler.js';
 import { JobQueue } from './queue.js';
@@ -122,11 +122,17 @@ export class Worker {
 
     this.store = new StateStore(this.settings.workspaceRoot);
     this.eventLog = new EventLog(forgeRoot);
-    this.budget = new BudgetTracker(forgeRoot, this.settings.budget);
-    this.resources = new ResourceMonitor(this.settings.resourceThresholds);
+    this.budget = new BudgetTracker(forgeRoot, this.settings.costTracking);
+    this.resources = new ResourceMonitor({
+      ...DEFAULT_THRESHOLDS,
+      resourceSlots: this.settings.resourceSlots,
+    });
     this.profiler = new ResourceProfiler(forgeRoot);
     this.adaptive = new AdaptiveConcurrency(this.resources, this.profiler, {
-      ceiling: this.settings.maxConcurrency > 0 ? this.settings.maxConcurrency : undefined,
+      ceiling: this.settings.concurrency.ceiling,
+      targetCpuLoad: this.settings.concurrency.targetCpuLoad,
+      criticalCpuLoad: this.settings.concurrency.criticalCpuLoad,
+      memoryPerAgentMb: this.settings.concurrency.memoryPerAgentMb,
     });
     this.agents = loadAgents(this.settings);
     this.queue = new JobQueue(forgeRoot);
@@ -245,9 +251,8 @@ export class Worker {
    * - Budget is exhausted
    * - SIGINT/SIGTERM received
    *
-   * Processes up to `maxConcurrency` jobs in parallel. Each tick, the
-   * worker fills empty slots from the queue. When a job finishes, its
-   * slot opens for the next queued job on the following tick.
+   * Fills available concurrency slots each tick using adaptive scaling.
+   * When a job finishes, its slot opens for the next queued job.
    *
    * @param keepAlive If true, don't exit when the queue is empty — wait for new jobs.
    */
@@ -341,39 +346,56 @@ export class Worker {
         continue;
       }
 
-      // Fill available concurrency slots (up to adaptive target)
+      // Fill available concurrency slots (up to adaptive target).
+      // Scans through queued jobs to find eligible ones — skips jobs
+      // blocked by project locks or resource slots instead of stopping
+      // at the first blocked job. This allows cross-project parallelism.
       let claimedAny = false;
       while (this._activeJobs < concurrency.target && !this._shutdownRequested) {
-        // Pre-check: peek at the next queued job's type and verify slot
-        // availability BEFORE claiming. This avoids the expensive
-        // claim→unclaim disk I/O cycle when slots are known-full.
-        const peeked = this.queue.queued()[0];
-        if (!peeked) break;  // No more queued jobs
+        const queued = this.queue.queued();
+        if (queued.length === 0) break;
 
-        // Per-project serialization for pr-fix jobs: only one fix at a time
-        // per project to prevent parallel fixes from creating new conflicts.
-        if (peeked.type === 'pr-fix' && peeked.project && this._projectFixLocks.has(peeked.project)) {
-          break; // Wait for current fix to finish before starting next
+        // Find the first eligible job in the queue
+        let eligible: Job | null = null;
+        let allBlocked = true;
+
+        for (const candidate of queued) {
+          // Per-project serialization for pr-fix jobs: only one fix at a time
+          // per project to prevent parallel fixes from creating new conflicts.
+          if (candidate.type === 'pr-fix' && candidate.project && this._projectFixLocks.has(candidate.project)) {
+            continue; // Skip — this project already has a fix running
+          }
+
+          const requiredSlots = JOB_RESOURCE_SLOTS[candidate.type] ?? [];
+          const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
+          if (blocked) {
+            if (!this._lastSlotBlockLogged || this._lastSlotBlockLogged !== blocked) {
+              this._lastSlotBlockLogged = blocked;
+              console.log(chalk.dim(`  ⏳ ${candidate.type} for ${candidate.project ?? '?'} waiting on "${blocked}" slot (${this.resources.slotSnapshot()[blocked]?.used ?? 0}/${this.resources.slotSnapshot()[blocked]?.capacity ?? '?'})`));
+            }
+            this.resources.recordBlock(blocked);
+            continue; // Skip — try next job in queue
+          }
+
+          // Found an eligible job
+          eligible = candidate;
+          allBlocked = false;
+          break;
         }
 
-        const requiredSlots = JOB_RESOURCE_SLOTS[peeked.type] ?? [];
-        const blocked = requiredSlots.find((s) => !this.resources.hasCapacity(s));
-        if (blocked) {
-          // Only log once per blocked period to avoid spam
-          if (!this._lastSlotBlockLogged || this._lastSlotBlockLogged !== blocked) {
-            this._lastSlotBlockLogged = blocked;
-            console.log(chalk.dim(`  ⏳ ${peeked.type} for ${peeked.project ?? '?'} waiting on "${blocked}" slot (${this.resources.slotSnapshot()[blocked]?.used ?? 0}/${this.resources.slotSnapshot()[blocked]?.capacity ?? '?'})`));
-          }
-          this.resources.recordBlock(blocked);
-          break; // Slots won't free until an in-flight job finishes
+        if (!eligible) {
+          // All queued jobs are blocked — nothing to claim this tick
+          if (allBlocked) this._lastSlotBlockLogged = null;
+          break;
         }
         this._lastSlotBlockLogged = null;
 
-        // Now actually claim from disk — slots are available
-        const job = this.queue.claim();
-        if (!job) break;
+        // Claim this specific job from disk
+        const job = this.queue.claimById(eligible.id);
+        if (!job) break; // Race condition — someone else claimed it
 
-        // Acquire all required slots
+        // Acquire all required resource slots
+        const requiredSlots = JOB_RESOURCE_SLOTS[job.type] ?? [];
         for (const slot of requiredSlots) {
           this.resources.acquire(slot, job.id);
         }
@@ -503,9 +525,8 @@ export class Worker {
       for (const rec of report.recommendations) {
         slotOverrides[rec.slot] = { capacity: rec.suggestedCapacity };
       }
-      console.log(chalk.dim('\n  Add to forge.config.json → "resourceThresholds" → "resourceSlots":'));
+      console.log(chalk.dim('\n  Add to forge.config.json → "resourceSlots":'));
       console.log(chalk.dim(`  ${JSON.stringify(slotOverrides, null, 2).split('\n').join('\n  ')}`));
-      console.log(chalk.dim(`\n  Also consider updating "phaseConcurrency" → "develop" to match build slot capacity.`));
       console.log();
     } else if (report.totalSamples > 0) {
       console.log(chalk.green('  No tuning changes suggested — current config looks good.\n'));

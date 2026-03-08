@@ -1,27 +1,27 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { cpus } from 'node:os';
 import type { BudgetConfig } from '../budget/budget-tracker.js';
 import { DEFAULT_BUDGET } from '../budget/budget-tracker.js';
-import type { ResourceThresholds } from '../monitor/resource-monitor.js';
-import { DEFAULT_THRESHOLDS, DEFAULT_RESOURCE_SLOTS } from '../monitor/resource-monitor.js';
+import type { ResourceSlotConfig } from '../monitor/resource-monitor.js';
+import { DEFAULT_RESOURCE_SLOTS } from '../monitor/resource-monitor.js';
 
 /**
- * Per-phase concurrency limits.
+ * Adaptive concurrency configuration.
  *
- * Design/plan are lightweight (mostly reading) — allow more.
- * Test is moderate (may spin up test runners).
- * Develop is heavy (may spin up servers, run full test suites).
- * PR/review are lightweight but we serialize to avoid git conflicts.
+ * Controls how the system scales agent count based on real CPU/memory
+ * pressure rather than static limits. The adaptive concurrency module
+ * reads these values to decide when to add or remove agents.
  */
-export interface PhaseConcurrency {
-  /** Design + plan agents (lightweight, read-heavy) */
-  readonly designPlan: number;
-  /** Test-engineer agents (moderate, may start test runners) */
-  readonly test: number;
-  /** Developer agents (heavy, may start services) */
-  readonly develop: number;
-  /** PR + review agents (lightweight but serialize for git safety) */
-  readonly prReview: number;
+export interface ConcurrencyConfig {
+  /** Hard maximum concurrent agents. Default: core count / 2, min 2 */
+  readonly ceiling: number;
+  /** Target CPU load factor (0-1). Scale up below this. Default: 0.65 */
+  readonly targetCpuLoad: number;
+  /** CPU load above which we MUST scale down immediately. Default: 0.85 */
+  readonly criticalCpuLoad: number;
+  /** Minimum free memory (MB) per additional agent. Default: 800 */
+  readonly memoryPerAgentMb: number;
 }
 
 export interface ForgeSettings {
@@ -50,22 +50,22 @@ export interface ForgeSettings {
   /** Maximum iterations per agent invocation (Ralph-style loop cap) */
   readonly maxIterations: number;
 
-  /** Overall max concurrent agent subprocesses (hard ceiling) */
-  readonly maxConcurrency: number;
+  /**
+   * Adaptive concurrency — CPU/memory-driven agent scaling.
+   * Replaces static maxConcurrency with dynamic scaling that responds
+   * to actual system load. The ceiling is the absolute hard cap.
+   */
+  readonly concurrency: ConcurrencyConfig;
 
   /**
-   * Per-phase concurrency limits.
-   * The orchestrator uses these to decide how many agents of each type
-   * can run simultaneously. The actual concurrency is
-   * min(phaseConcurrency[phase], maxConcurrency - activeOtherPhases).
+   * Cost tracking configuration. Budget is informational only —
+   * subscription rate limits are the real cap. These thresholds
+   * trigger warnings but don't gate job dispatch.
    */
-  readonly phaseConcurrency: PhaseConcurrency;
+  readonly costTracking: BudgetConfig;
 
-  /** Budget configuration (cost limits per run and per day) */
-  readonly budget: BudgetConfig;
-
-  /** System resource thresholds for health checking */
-  readonly resourceThresholds: ResourceThresholds;
+  /** Named resource slots with capacity limits (build, browser, devServer) */
+  readonly resourceSlots: Readonly<Record<string, ResourceSlotConfig>>;
 
   /** Whether to auto-create PRs or just prepare branches */
   readonly autoCreatePR: boolean;
@@ -74,11 +74,11 @@ export interface ForgeSettings {
   readonly researchIntervalHours: number;
 }
 
-const DEFAULT_PHASE_CONCURRENCY: PhaseConcurrency = {
-  designPlan: 2,   // Lightweight — can run a couple
-  test: 1,         // Conservative — one test agent at a time
-  develop: 1,      // Conservative — one dev agent at a time
-  prReview: 1,     // Serialize — avoid git branch conflicts
+const DEFAULT_CONCURRENCY: ConcurrencyConfig = {
+  ceiling: Math.max(2, Math.floor(cpus().length / 2)),
+  targetCpuLoad: 0.65,
+  criticalCpuLoad: 0.85,
+  memoryPerAgentMb: 800,
 };
 
 const DEFAULT_SETTINGS: ForgeSettings = {
@@ -97,10 +97,9 @@ const DEFAULT_SETTINGS: ForgeSettings = {
     reflector: 'sonnet',      // Reflection needs analytical depth
   },
   maxIterations: 10,
-  maxConcurrency: 2,
-  phaseConcurrency: DEFAULT_PHASE_CONCURRENCY,
-  budget: DEFAULT_BUDGET,
-  resourceThresholds: DEFAULT_THRESHOLDS,
+  concurrency: DEFAULT_CONCURRENCY,
+  costTracking: DEFAULT_BUDGET,
+  resourceSlots: DEFAULT_RESOURCE_SLOTS,
   autoCreatePR: true,
   researchIntervalHours: 24,
 };
@@ -113,7 +112,16 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
 
   if (existsSync(configPath)) {
     const raw = readFileSync(configPath, 'utf-8');
-    const overrides = JSON.parse(raw) as Partial<ForgeSettings>;
+    // Support both new config shape and legacy fields for backward compat
+    const overrides = JSON.parse(raw) as Partial<ForgeSettings> & {
+      maxConcurrency?: number;
+      budget?: BudgetConfig;
+      resourceThresholds?: { minAvailableMemoryMb?: number; resourceSlots?: Record<string, ResourceSlotConfig> };
+    };
+
+    // Migrate legacy maxConcurrency → concurrency.ceiling
+    const legacyCeiling = overrides.maxConcurrency;
+
     return {
       ...DEFAULT_SETTINGS,
       ...overrides,
@@ -122,21 +130,19 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
         ...DEFAULT_SETTINGS.models,
         ...(overrides.models ?? {}),
       },
-      phaseConcurrency: {
-        ...DEFAULT_PHASE_CONCURRENCY,
-        ...(overrides.phaseConcurrency ?? {}),
+      concurrency: {
+        ...DEFAULT_CONCURRENCY,
+        ...(overrides.concurrency ?? {}),
+        // Legacy maxConcurrency overrides ceiling if concurrency.ceiling not set
+        ...(legacyCeiling && !overrides.concurrency?.ceiling ? { ceiling: legacyCeiling } : {}),
       },
-      budget: {
+      costTracking: {
         ...DEFAULT_BUDGET,
-        ...(overrides.budget ?? {}),
+        ...(overrides.costTracking ?? overrides.budget ?? {}),
       },
-      resourceThresholds: {
-        ...DEFAULT_THRESHOLDS,
-        ...(overrides.resourceThresholds ?? {}),
-        resourceSlots: {
-          ...DEFAULT_RESOURCE_SLOTS,
-          ...((overrides.resourceThresholds as Partial<ResourceThresholds> | undefined)?.resourceSlots ?? {}),
-        },
+      resourceSlots: {
+        ...DEFAULT_RESOURCE_SLOTS,
+        ...(overrides.resourceSlots ?? overrides.resourceThresholds?.resourceSlots ?? {}),
       },
     };
   }
