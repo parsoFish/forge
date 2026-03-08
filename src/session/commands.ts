@@ -108,29 +108,6 @@ const commands: SlashCommand[] = [
       await ctx.orch.reflect();
     },
   },
-  {
-    name: 'run',
-    aliases: [],
-    description: 'Queue full pipeline for a project',
-    usage: '/run <project>',
-    handler: async (ctx, args) => {
-      if (!args[0]) {
-        console.log(chalk.red('  Usage: /run <project>'));
-        return;
-      }
-      await ctx.orch.runProject(args[0]);
-    },
-  },
-  {
-    name: 'run-all',
-    aliases: ['ra'],
-    description: 'Queue full pipeline for all projects',
-    usage: '/run-all',
-    handler: async (ctx) => {
-      await ctx.orch.runAll();
-    },
-  },
-
   // --- Info commands ---
   {
     name: 'status',

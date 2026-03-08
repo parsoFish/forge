@@ -67,8 +67,6 @@ forge worker                    # Process the queue
 | `forge fix <pr#> --project <name>` | Autonomous review/fix loop for a PR |
 | `forge fix-all [project]` | Fix loop for all open PRs |
 | `forge reflect` | Analyze cycle outcomes and extract learnings |
-| `forge run <project>` | Full pipeline: roadmap + plan + implement |
-| `forge run-all` | Full pipeline for all managed projects |
 
 ### Worker
 

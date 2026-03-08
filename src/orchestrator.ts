@@ -640,56 +640,6 @@ export class Orchestrator {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════
-  // Legacy / Convenience Commands
-  // ═══════════════════════════════════════════════════════════════════
-
-  /**
-   * Queue a full pipeline for a single project (roadmap + plan + implement).
-   */
-  async runProject(projectName: string): Promise<void> {
-    this.validateProject(projectName);
-
-    // Post jobs — the worker will execute them in priority order
-    // (roadmap=10 → plan=20 → implement=30), so order is preserved.
-    const roadmapJob = this.queue.post('roadmap', 'roadmapping', projectName, {});
-    const planJob = this.queue.post('plan', 'implementation', projectName, {});
-    const implJob = this.queue.post('implement', 'implementation', projectName, {});
-
-    console.log(chalk.bold.blue(`\n▶ Full pipeline for ${projectName}: queued 3 jobs`));
-    console.log(chalk.dim(`    ${roadmapJob.id}: roadmap`));
-    console.log(chalk.dim(`    ${planJob.id}: plan`));
-    console.log(chalk.dim(`    ${implJob.id}: implement`));
-    this.printWorkerHint();
-
-    this.eventLog.emit({
-      type: 'jobs.queued',
-      summary: `Queued full pipeline (3 jobs) for ${projectName}`,
-    });
-  }
-
-  /**
-   * Queue the full pipeline for ALL managed projects.
-   */
-  async runAll(): Promise<void> {
-    let total = 0;
-    for (const project of this.settings.projects) {
-      this.queue.post('roadmap', 'roadmapping', project, {});
-      this.queue.post('plan', 'implementation', project, {});
-      this.queue.post('implement', 'implementation', project, {});
-      total += 3;
-    }
-
-    console.log(chalk.bold.blue(`\n▶ Full pipeline for all projects: queued ${total} jobs`));
-    console.log(chalk.dim(`  Projects: ${this.settings.projects.join(', ')}`));
-    this.printWorkerHint();
-
-    this.eventLog.emit({
-      type: 'jobs.queued',
-      summary: `Queued full pipeline (${total} jobs) for all projects`,
-    });
-  }
-
   /**
    * Resume pending work by queuing appropriate jobs based on current phase.
    */

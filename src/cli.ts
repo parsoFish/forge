@@ -4,12 +4,13 @@
  * Forge CLI — command-line interface for the orchestrator.
  *
  * Job-posting commands (fast, non-blocking):
- *   forge roadmap [project]   Queue roadmap generation jobs
- *   forge plan [project]      Queue work item planning jobs
- *   forge implement [project] Queue implementation jobs
- *   forge reflect             Queue a reflection/learning job
- *   forge run <project>       Queue full pipeline (roadmap + plan + implement)
- *   forge run-all             Queue full pipeline for all projects
+ *   forge roadmap [project]       Queue roadmap generation jobs
+ *   forge plan [project]          Queue work item planning jobs
+ *   forge implement [project]     Queue implementation jobs
+ *   forge review [project]        Scan open PRs and queue review jobs
+ *   forge fix <pr#> -p <project>  Autonomous review/fix loop for a PR
+ *   forge fix-all [project]       Fix loop for all open PRs
+ *   forge reflect                 Queue a reflection/learning job
  *
  * Worker (long-running):
  *   forge worker              Start the job worker (processes queued jobs)
@@ -18,6 +19,8 @@
  * Queue management:
  *   forge jobs                Show job queue status
  *   forge cancel [job-id]     Cancel queued jobs
+ *   forge retry               Reset failed jobs back to queued
+ *   forge resume [project]    Resume work based on current phase
  *
  * Info:
  *   forge status              Show current state
@@ -147,32 +150,6 @@ program
     try {
       const orch = new Orchestrator();
       await orch.reflect();
-    } catch (error) {
-      console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('run <project>')
-  .description('Queue full pipeline (roadmap + plan + implement) for a project')
-  .action(async (project: string) => {
-    try {
-      const orch = new Orchestrator();
-      await orch.runProject(project);
-    } catch (error) {
-      console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('run-all')
-  .description('Queue full pipeline for all managed projects')
-  .action(async () => {
-    try {
-      const orch = new Orchestrator();
-      await orch.runAll();
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
       process.exit(1);

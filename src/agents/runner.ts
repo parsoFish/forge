@@ -6,7 +6,7 @@
  * Claude CLI session with an injected system prompt.
  *
  * Two modes:
- * - AgentRun class: event-emitting handle for async/parallel use (pool)
+ * - AgentRun class: event-emitting handle for async/parallel use
  * - runAgent(): blocking convenience wrapper
  *
  * Follows Ralph's pattern: fresh context per invocation. The agent reads state
