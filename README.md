@@ -180,4 +180,4 @@ npm run typecheck      # Type-check without emitting
 
 ## License
 
-[Business Source License 1.1](LICENSE) — source available, converts to MIT after 4 years.
+[Apache License 2.0](LICENSE)
