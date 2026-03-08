@@ -17,7 +17,7 @@
 import { resolve } from 'node:path';
 import chalk from 'chalk';
 import { loadAgents, type AgentRole, type AgentDefinition } from './agents/index.js';
-import { loadSettings, type ForgeSettings } from './config/index.js';
+import { loadSettings, resolveProjectPath, type ForgeSettings } from './config/index.js';
 import { StateStore } from './state/index.js';
 import { EventLog } from './events/index.js';
 import { BudgetTracker } from './budget/index.js';
@@ -216,7 +216,7 @@ export class Orchestrator {
 
     if (projectName) {
       this.validateProject(projectName);
-      const prs = scanOpenPRs([projectName], this.settings.workspaceRoot);
+      const prs = scanOpenPRs([projectName], this.settings.workspaceRoot, this.settings.projectsDir);
 
       if (prs.length === 0) {
         console.log(chalk.dim(`\n  No open PRs found for ${projectName}.\n`));
@@ -247,7 +247,7 @@ export class Orchestrator {
       }
     } else {
       // Scan all projects and post per-PR jobs directly
-      const prs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot);
+      const prs = scanOpenPRs(this.settings.projects, this.settings.workspaceRoot, this.settings.projectsDir);
 
       if (prs.length === 0) {
         console.log(chalk.dim('\n  No open PRs found across managed projects.\n'));
@@ -286,6 +286,154 @@ export class Orchestrator {
   }
 
   /**
+   * Interactive review — triage PRs with user input before queuing.
+   *
+   * Shows each PR's intent and changes, lets the user accept, skip,
+   * or provide feedback that gets included in the review prompt.
+   * This replaces blind queue-all-and-go for the session's /review command.
+   */
+  async interactiveReview(projectName?: string, askFn?: (prompt: string) => Promise<string>): Promise<void> {
+    const { scanOpenPRs, interactiveTriagePRs } = await import('./workflow/stages/review-prs.js');
+
+    // Cancel stale queued review/pr-fix jobs
+    const cancelledReviews = this.queue.cancelByType('review', projectName ?? undefined);
+    const cancelledFixes = this.queue.cancelByType('pr-fix', projectName ?? undefined);
+    if (cancelledReviews + cancelledFixes > 0) {
+      console.log(chalk.dim(`  Cancelled ${cancelledReviews + cancelledFixes} stale review/fix job(s) from previous run.`));
+    }
+
+    const projects = projectName
+      ? (this.validateProject(projectName), [projectName])
+      : [...this.settings.projects];
+
+    const prs = scanOpenPRs(projects, this.settings.workspaceRoot, this.settings.projectsDir);
+
+    if (prs.length === 0) {
+      console.log(chalk.dim('\n  No open PRs found.\n'));
+      return;
+    }
+
+    // Interactive triage — pass askFn to avoid creating a second readline
+    const decisions = await interactiveTriagePRs(prs, this.settings.workspaceRoot, this.settings.projectsDir, askFn);
+
+    const accepted = decisions.filter((d) => d.action !== 'skip');
+    if (accepted.length === 0) {
+      console.log(chalk.dim('  No PRs selected for review.\n'));
+      return;
+    }
+
+    // Chain consolidation: group accepted PRs by chain tip.
+    // For chains, we queue a single consolidated review job for the tip PR
+    // that includes feedback from all chain members. The tip branch already
+    // contains all ancestor commits — fixing only the tip is sufficient.
+    const chainGroups = new Map<number, typeof accepted>(); // tipPR# → decisions
+    const standalone: typeof accepted = [];
+
+    for (const d of accepted) {
+      const tipNum = d.pr.chainTipPR;
+      if (tipNum && tipNum !== d.pr.number) {
+        // This PR is part of a chain but not the tip — group it
+        const group = chainGroups.get(tipNum) ?? [];
+        group.push(d);
+        chainGroups.set(tipNum, group);
+      } else if (d.pr.chainMembers && d.pr.chainMembers.length > 1) {
+        // This IS the chain tip — start its group
+        const group = chainGroups.get(d.pr.number) ?? [];
+        group.push(d);
+        chainGroups.set(d.pr.number, group);
+      } else {
+        standalone.push(d);
+      }
+    }
+
+    const jobs: import('./jobs/types.js').Job[] = [];
+
+    // Queue standalone PR reviews normally
+    for (const d of standalone) {
+      jobs.push(this.queue.post('review', 'review', d.pr.project, {
+        prNumber:      d.pr.number,
+        prTitle:       d.pr.title,
+        prUrl:         d.pr.url,
+        branch:        d.pr.branch,
+        repo:          d.pr.repo,
+        project:       d.pr.project,
+        prCreatedAt:   d.pr.createdAt,
+        mergeLayer:    d.pr.mergeLayer,
+        dependsOnPRs:  d.pr.dependsOnPRs,
+        blocksPRs:     d.pr.blocksPRs,
+        uniqueHeadSha: d.pr.uniqueHeadSha,
+        ...(d.feedback ? { userFeedback: d.feedback } : {}),
+        userTriaged: true,
+      }, 5 + d.pr.mergeLayer));
+    }
+
+    // Queue consolidated review jobs for chains — one job per chain tip
+    for (const [tipNum, group] of chainGroups) {
+      // Find the tip PR's decision (it may or may not be in the accepted list)
+      const tipDecision = group.find((d) => d.pr.number === tipNum);
+      const tipPR = tipDecision?.pr ?? prs.find((pr) => pr.number === tipNum);
+      if (!tipPR) continue;
+
+      // Collect feedback from all chain members
+      const chainFeedback = group
+        .filter((d) => d.feedback)
+        .map((d) => `PR #${d.pr.number} (${d.pr.title}): ${d.feedback}`)
+        .join('\n');
+
+      // Collect all ancestor PR numbers for the consolidated close-on-merge
+      const ancestorPRs = (tipPR.chainMembers ?? []).filter((n) => n !== tipNum);
+
+      jobs.push(this.queue.post('review', 'review', tipPR.project, {
+        prNumber:      tipPR.number,
+        prTitle:       tipPR.title,
+        prUrl:         tipPR.url,
+        branch:        tipPR.branch,
+        repo:          tipPR.repo,
+        project:       tipPR.project,
+        prCreatedAt:   tipPR.createdAt,
+        mergeLayer:    0, // Chain tip gets priority — it's the only one that needs fixing
+        dependsOnPRs:  [],
+        blocksPRs:     [],
+        uniqueHeadSha: tipPR.uniqueHeadSha,
+        ...(chainFeedback ? { userFeedback: chainFeedback } : {}),
+        userTriaged: true,
+        // Chain consolidation metadata
+        isChainTip: true,
+        ancestorPRs,
+        chainSize: (tipPR.chainMembers ?? []).length,
+      }, 5));
+
+      // Log the chain consolidation
+      console.log(chalk.bold.cyan(`  Chain consolidation: ${ancestorPRs.length + 1} PRs → PR #${tipNum} (tip)`));
+      for (const d of group) {
+        const isTop = d.pr.number === tipNum ? chalk.bold(' ← tip') : '';
+        console.log(chalk.dim(`    PR #${d.pr.number}: ${d.pr.title}${isTop}`));
+      }
+      // Show ancestor PRs that weren't explicitly accepted but will be closed
+      for (const ancestorNum of ancestorPRs) {
+        if (!group.some((d) => d.pr.number === ancestorNum)) {
+          const ancestorPR = prs.find((pr) => pr.number === ancestorNum);
+          if (ancestorPR) {
+            console.log(chalk.dim(`    PR #${ancestorNum}: ${ancestorPR.title} (auto-included in chain)`));
+          }
+        }
+      }
+    }
+
+    console.log(chalk.bold.blue(`\n▶ Review: queued ${jobs.length} review job(s) (${chainGroups.size} chain(s), ${standalone.length} standalone)`));
+    for (const d of standalone) {
+      const layerLabel = d.pr.mergeLayer > 0 ? ` [layer ${d.pr.mergeLayer}]` : ' [foundation]';
+      const feedbackNote = d.feedback ? chalk.cyan(' +feedback') : '';
+      console.log(chalk.dim(`    [${d.pr.project}] PR #${d.pr.number}${layerLabel} — ${d.pr.title}${feedbackNote}`));
+    }
+
+    this.eventLog.emit({
+      type: 'jobs.queued',
+      summary: `Queued ${jobs.length} PR review jobs (${chainGroups.size} consolidated chain(s), ${standalone.length} standalone)`,
+    });
+  }
+
+  /**
    * Queue a reflection job.
    * Returns immediately — use `forge worker` to execute.
    */
@@ -314,7 +462,7 @@ export class Orchestrator {
 
     // Look up PR metadata via gh
     const { execSync } = await import('node:child_process');
-    const projectPath = resolve(this.settings.workspaceRoot, projectName);
+    const projectPath = resolveProjectPath(this.settings, projectName);
 
     let prData: { branch: string; repo: string; title: string; headSha: string };
     try {
@@ -360,6 +508,76 @@ export class Orchestrator {
     this.eventLog.emit({
       type: 'jobs.queued',
       summary: `Queued pr-fix for PR #${prNumber} in ${projectName} (round 1, autonomous)`,
+    });
+  }
+
+  /**
+   * Queue fix jobs for ALL open PRs across all (or one) project(s).
+   *
+   * This is the batch version of `fix()`. It scans for open PRs, then
+   * queues a pr-fix job for each one at round 1 — kicking off the
+   * autonomous review→fix→re-review loop for every open PR.
+   */
+  async fixAll(projectName?: string): Promise<void> {
+    const { scanOpenPRs } = await import('./workflow/stages/review-prs.js');
+    const { execSync } = await import('node:child_process');
+
+    const projects = projectName
+      ? [this.validateAndReturn(projectName)]
+      : [...this.settings.projects];
+
+    // Cancel stale pr-fix jobs to prevent duplicate processing
+    const cancelled = this.queue.cancelByType('pr-fix', projectName ?? undefined);
+    if (cancelled > 0) {
+      console.log(chalk.dim(`  Cancelled ${cancelled} stale pr-fix job(s) from previous run.`));
+    }
+
+    const prs = scanOpenPRs(projects, this.settings.workspaceRoot, this.settings.projectsDir);
+
+    if (prs.length === 0) {
+      console.log(chalk.dim('\n  No open PRs found to fix.\n'));
+      return;
+    }
+
+    const jobs: { prNumber: number; project: string; title: string }[] = [];
+    for (const pr of prs) {
+      // Get HEAD SHA for each PR
+      let headSha = pr.uniqueHeadSha ?? '';
+      if (!headSha) {
+        try {
+          const projectPath = resolveProjectPath(this.settings, pr.project);
+          const json = execSync(
+            `gh pr view ${pr.number} --json headRefOid --jq .headRefOid`,
+            { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          ).trim();
+          headSha = json;
+        } catch {
+          headSha = '';
+        }
+      }
+
+      this.queue.post('pr-fix', 'pr-fix' as import('./jobs/types.js').JobPhase, pr.project, {
+        prNumber: pr.number,
+        repo: pr.repo,
+        project: pr.project,
+        branch: pr.branch,
+        prTitle: pr.title,
+        fixRound: 1,
+        lastReviewedSha: headSha,
+      }, 12);
+
+      jobs.push({ prNumber: pr.number, project: pr.project, title: pr.title });
+    }
+
+    console.log(chalk.bold.blue(`\n▶ Fix-all: queued ${jobs.length} pr-fix job(s)`));
+    for (const j of jobs) {
+      console.log(chalk.dim(`    [${j.project}] PR #${j.prNumber} — ${j.title}`));
+    }
+    this.printWorkerHint();
+
+    this.eventLog.emit({
+      type: 'jobs.queued',
+      summary: `Queued ${jobs.length} pr-fix jobs across ${projects.join(', ')}`,
     });
   }
 

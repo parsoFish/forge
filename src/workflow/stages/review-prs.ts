@@ -24,9 +24,12 @@
 import { execSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import * as readline from 'node:readline';
+import chalk from 'chalk';
 import type { AgentDefinition } from '../../agents/types.js';
 import type { AgentResult } from '../../agents/types.js';
 import { runAgent } from '../../agents/runner.js';
+import { getTriageDecision, setTriageDecision, pruneTriageRecords } from './triage-store.js';
 
 export interface OpenPR {
   number: number;
@@ -47,6 +50,18 @@ export interface OpenPR {
    * this PR from its dependencies). Used to confirm the agent reviews only the delta.
    */
   uniqueHeadSha: string;
+  /**
+   * Chain consolidation: the PR number at the tip of this PR's chain.
+   * The tip already contains all commits from ancestor PRs. Fixes are applied
+   * only to the tip; ancestor PRs are closed after the tip merges.
+   * Undefined or equal to own number = this PR IS the tip (or standalone).
+   */
+  chainTipPR?: number;
+  /**
+   * All PR numbers in this PR's chain (including itself), ordered root→tip.
+   * Only populated on the chain tip PR. Empty for standalone PRs.
+   */
+  chainMembers?: number[];
 }
 
 /**
@@ -134,12 +149,43 @@ function buildMergeOrder(prs: OpenPR[], cwd: string): OpenPR[] {
     return myCommits.find((sha) => !depCommits.has(sha)) ?? (myCommits[0] ?? '');
   }
 
+  // Build chain info: walk each linear chain from roots to tips.
+  // A "chain" is a linear sequence where each PR has exactly one child.
+  // If a PR has multiple children, each child starts a new chain.
+  const chainTip = new Map<number, number>();   // pr# → tip of its chain
+  const chainMembers = new Map<number, number[]>(); // tip pr# → ordered members
+
+  // Find chain tips: PRs that block nothing (leaf nodes)
+  const tips = prs.filter((pr) => (blocks.get(pr.number) ?? []).length === 0);
+
+  for (const tip of tips) {
+    // Walk backwards from tip to root following dependsOn
+    const chain: number[] = [tip.number];
+    let current = tip.number;
+    while (true) {
+      const deps = dependsOn.get(current) ?? [];
+      if (deps.length !== 1) break; // Not a linear chain or reached root
+      current = deps[0];
+      chain.unshift(current);
+    }
+
+    // Only mark as chain if there are multiple members
+    if (chain.length > 1) {
+      chainMembers.set(tip.number, chain);
+      for (const member of chain) {
+        chainTip.set(member, tip.number);
+      }
+    }
+  }
+
   return prs.map((pr) => ({
     ...pr,
     mergeLayer:     layers.get(pr.number) ?? 0,
     dependsOnPRs:   dependsOn.get(pr.number) ?? [],
     blocksPRs:      blocks.get(pr.number) ?? [],
     uniqueHeadSha:  findUniqueHead(pr.number),
+    chainTipPR:     chainTip.get(pr.number),
+    chainMembers:   chainMembers.get(pr.number),
   }));
 }
 
@@ -153,6 +199,7 @@ function buildMergeOrder(prs: OpenPR[], cwd: string): OpenPR[] {
 export function scanOpenPRs(
   projects: readonly string[],
   workspaceRoot: string,
+  projectsDir = '.',
 ): OpenPR[] {
   const forgeRoot = resolve(workspaceRoot, '.forge');
   const learningsDir = join(forgeRoot, 'learnings');
@@ -161,7 +208,7 @@ export function scanOpenPRs(
   const rawPRs: OpenPR[] = [];
 
   for (const project of projects) {
-    const projectPath = resolve(workspaceRoot, project);
+    const projectPath = resolve(workspaceRoot, projectsDir, project);
     try {
       // Get git remote to derive owner/repo
       const remoteUrl = execSync('git remote get-url origin', {
@@ -288,8 +335,9 @@ export async function runPRReviewStage(
   agent: AgentDefinition,
   pr: OpenPR,
   workspaceRoot: string,
+  projectsDir = '.',
 ): Promise<AgentResult> {
-  const projectPath = resolve(workspaceRoot, pr.project);
+  const projectPath = resolve(workspaceRoot, projectsDir, pr.project);
   const forgeRoot = resolve(workspaceRoot, '.forge');
   const learningsDir = join(forgeRoot, 'learnings');
   const date = new Date().toISOString().slice(0, 10);
@@ -311,8 +359,30 @@ export async function runPRReviewStage(
   }
 
   // Build merge-order context block
+  const isChainTip = (pr.chainMembers ?? []).length > 1;
   const isStacked = pr.dependsOnPRs.length > 0 || pr.blocksPRs.length > 0;
-  const mergeContextBlock = isStacked ? `
+
+  // Chain tip PRs get a consolidated review context — they contain ALL the work
+  const mergeContextBlock = isChainTip ? `
+## Consolidated Chain Review (IMPORTANT)
+
+This PR is the **tip of a ${pr.chainMembers!.length}-PR chain**. Its branch contains
+ALL commits from the ancestor PRs listed below. This is a **consolidated review** —
+you are reviewing the holistic body of work, not just this PR's unique delta.
+
+- **Chain members (root→tip):** ${pr.chainMembers!.map((n) => `#${n}`).join(' → ')}
+- **This PR (#${pr.number}) is the chain tip** — all fixes will be applied here
+- **After approval:** this PR will be merged and all ancestor PRs will be closed
+
+Review the FULL diff against main. All changes across the chain are your scope.
+Focus on:
+1. Does the overall implementation hang together? Are there cross-cutting issues
+   that individual PR reviews might miss?
+2. Are there conflicts with main that need resolution?
+3. Does the combined changeset meet the project's quality standards?
+
+\`gh pr diff ${pr.number} --repo ${pr.repo}\`
+` : isStacked ? `
 ## Stacked Branch Context (IMPORTANT)
 
 This PR is part of a **stacked branch chain**. Its branch contains commits from
@@ -385,4 +455,281 @@ When done, output a summary line:
     cwd: projectPath,
     maxTurns: 20,
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Interactive PR Triage
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Result of triaging a single PR. */
+export interface TriageDecision {
+  readonly pr: OpenPR;
+  /** 'accept' = queue review as-is, 'skip' = don't review, 'feedback' = include user notes */
+  readonly action: 'accept' | 'skip' | 'feedback';
+  /** User feedback to include in the review prompt (only when action='feedback'). */
+  readonly feedback?: string;
+}
+
+/**
+ * Fetch a full summary of a PR's intent and changes for display.
+ * Uses `gh` to get the PR body, changed files, and comment status.
+ */
+function fetchPRSummary(pr: OpenPR, projectPath: string): {
+  body: string;
+  files: string[];
+  diffstat: string;
+  hasHumanComments: boolean;
+  mergeable: string;
+} {
+  let body = '';
+  let files: string[] = [];
+  let diffstat = '';
+  let hasHumanComments = false;
+  let mergeable = '';
+
+  try {
+    const prView = execSync(
+      `gh pr view ${pr.number} --repo ${pr.repo} --json body,comments,files,additions,deletions,mergeable`,
+      { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const parsed = JSON.parse(prView) as {
+      body?: string;
+      comments?: Array<{ author?: { login?: string } }>;
+      files?: Array<{ path: string; additions: number; deletions: number }>;
+      additions?: number;
+      deletions?: number;
+      mergeable?: string;
+    };
+    body = (parsed.body ?? '').trim();
+    mergeable = parsed.mergeable ?? '';
+
+    // Build file list with +/- counts
+    if (parsed.files) {
+      files = parsed.files.map((f) => `${f.path} (+${f.additions} -${f.deletions})`);
+    }
+
+    // Build diffstat from totals
+    const adds = parsed.additions ?? 0;
+    const dels = parsed.deletions ?? 0;
+    const fileCount = parsed.files?.length ?? 0;
+    diffstat = `${fileCount} file(s), +${adds} -${dels}`;
+
+    // Check for non-bot comments
+    const comments = parsed.comments ?? [];
+    hasHumanComments = comments.some((c) => {
+      const login = c.author?.login ?? '';
+      return login.length > 0 && !login.endsWith('[bot]') && !login.includes('github-actions');
+    });
+  } catch { /* gh not available or PR not found */ }
+
+  return { body, files, diffstat, hasHumanComments, mergeable };
+}
+
+/** Function signature for asking the user a question. */
+export type AskFn = (prompt: string) => Promise<string>;
+
+/**
+ * Create a standalone askFn backed by its own readline.
+ * Used when running from the CLI (no session) — the caller must close
+ * the returned cleanup function when done.
+ */
+function createStandaloneAsk(): { ask: AskFn; cleanup: () => void } {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: process.stdin.isTTY ?? false,
+  });
+  return {
+    ask: (prompt: string) => new Promise((resolve) => rl.question(prompt, resolve)),
+    cleanup: () => rl.close(),
+  };
+}
+
+/**
+ * Interactively triage PRs with the user.
+ *
+ * For each PR, shows: title, full body, file list, human comment status.
+ * User can: [a]ccept (queue review), [s]kip, or type feedback.
+ *
+ * Already-triaged PRs (same HEAD SHA) are auto-included with their previous
+ * decision — the user isn't re-asked unless the PR has new commits.
+ *
+ * @param askFn  Question function — pass the session's question() when running
+ *               inside the REPL. If omitted, creates a standalone readline
+ *               (safe for CLI-only use where there's no session).
+ */
+export async function interactiveTriagePRs(
+  prs: readonly OpenPR[],
+  workspaceRoot: string,
+  projectsDir = '.',
+  askFn?: AskFn,
+): Promise<readonly TriageDecision[]> {
+  if (prs.length === 0) return [];
+
+  const forgeRoot = resolve(workspaceRoot, '.forge');
+
+  // Prune stale triage records for PRs no longer in the open set
+  const openKeys = new Set(prs.map((pr) => `${pr.repo}#${pr.number}`));
+  pruneTriageRecords(forgeRoot, openKeys);
+
+  // Separate PRs into already-triaged (auto-include) vs needs-triage
+  const needsTriage: OpenPR[] = [];
+  const autoIncluded: TriageDecision[] = [];
+
+  for (const pr of prs) {
+    // Get current HEAD SHA to check if PR has changed since last triage
+    let currentSha = pr.uniqueHeadSha;
+    if (!currentSha) {
+      try {
+        currentSha = execSync(
+          `gh api repos/${pr.repo}/pulls/${pr.number} --jq .head.sha`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        ).trim();
+      } catch { currentSha = ''; }
+    }
+
+    const existing = getTriageDecision(forgeRoot, pr.repo, pr.number, currentSha);
+    if (existing) {
+      // Already triaged with same SHA — auto-include with previous decision
+      autoIncluded.push({
+        pr,
+        action: existing.action,
+        ...(existing.feedback ? { feedback: existing.feedback } : {}),
+      });
+    } else {
+      needsTriage.push(pr);
+    }
+  }
+
+  // Show auto-included PRs
+  if (autoIncluded.length > 0) {
+    console.log(chalk.dim(`\n  ${autoIncluded.length} PR(s) already triaged (no new commits):`));
+    for (const d of autoIncluded) {
+      const actionLabel = d.action === 'skip' ? chalk.dim('skip') : chalk.green(d.action);
+      console.log(chalk.dim(`    PR #${d.pr.number} [${d.pr.project}] — ${actionLabel}`));
+    }
+    console.log();
+  }
+
+  if (needsTriage.length === 0) {
+    console.log(chalk.dim('  All PRs already triaged. Re-using previous decisions.\n'));
+    return autoIncluded;
+  }
+
+  // Use provided askFn (session) or create standalone readline (CLI)
+  const standalone = askFn ? null : createStandaloneAsk();
+  const ask = askFn ?? standalone!.ask;
+
+  const newDecisions: TriageDecision[] = [];
+
+  console.log(chalk.bold(`\n  PR Review Triage — ${needsTriage.length} PR(s) need triage\n`));
+  console.log(chalk.dim('  For each PR: [a]ccept, [s]kip, or type feedback to include in the review.\n'));
+
+  try {
+    for (let i = 0; i < needsTriage.length; i++) {
+      const pr = needsTriage[i];
+      const projectPath = resolve(workspaceRoot, projectsDir, pr.project);
+      const { body, files, diffstat, hasHumanComments, mergeable } = fetchPRSummary(pr, projectPath);
+
+      // Header
+      const layerLabel = pr.mergeLayer > 0 ? chalk.yellow(` [layer ${pr.mergeLayer}]`) : chalk.green(' [foundation]');
+      const chainLabel = pr.chainTipPR && pr.chainTipPR !== pr.number
+        ? chalk.cyan(` → chain tip #${pr.chainTipPR}`)
+        : pr.chainMembers && pr.chainMembers.length > 1
+          ? chalk.bold.cyan(` [chain tip: ${pr.chainMembers.length} PRs]`)
+          : '';
+      console.log(chalk.bold(`  ── PR #${pr.number}${layerLabel}${chainLabel} ── ${pr.project} ──`));
+      console.log(chalk.cyan(`  ${pr.title}`));
+      console.log(chalk.dim(`  ${pr.url}`));
+
+      // Merge status
+      if (mergeable === 'CONFLICTING') {
+        console.log(chalk.red('  ⚠ Has merge conflicts with main — fix will resolve'));
+      } else if (mergeable === 'MERGEABLE') {
+        console.log(chalk.green('  ✓ Mergeable'));
+      }
+
+      // Chain info
+      if (pr.chainMembers && pr.chainMembers.length > 1) {
+        console.log(chalk.cyan(`  Chain: ${pr.chainMembers.map((n) => `#${n}`).join(' → ')} (this is the tip — merging this lands all)`));
+      } else if (pr.chainTipPR && pr.chainTipPR !== pr.number) {
+        console.log(chalk.dim(`  Part of chain → fixes will be applied to tip PR #${pr.chainTipPR}`));
+      }
+
+      // Full PR body — this is the user's one chance to understand the PR
+      if (body) {
+        console.log(chalk.dim('  ─── Description ───'));
+        // Indent each line for visual alignment
+        for (const line of body.split('\n')) {
+          console.log(`  ${line}`);
+        }
+      }
+
+      // Changed files list
+      if (files.length > 0) {
+        console.log(chalk.dim('  ─── Files Changed ───'));
+        for (const file of files) {
+          console.log(chalk.dim(`    ${file}`));
+        }
+        console.log(chalk.dim(`  ${diffstat}`));
+      }
+
+      // Human comment status
+      if (hasHumanComments) {
+        console.log(chalk.yellow('  Has human comments — will extract direction'));
+      } else {
+        console.log(chalk.dim('  No human comments yet — principles-only review'));
+      }
+
+      // Dependencies (only show if not already covered by chain info)
+      if (pr.dependsOnPRs.length > 0 && !pr.chainTipPR) {
+        console.log(chalk.yellow(`  Depends on: ${pr.dependsOnPRs.map((n) => `#${n}`).join(', ')}`));
+      }
+      if (pr.blocksPRs.length > 0 && !pr.chainMembers) {
+        console.log(chalk.dim(`  Blocks: ${pr.blocksPRs.map((n) => `#${n}`).join(', ')}`));
+      }
+
+      console.log();
+
+      const answer = await ask(chalk.blue(`  [${i + 1}/${needsTriage.length}] `) + 'Action ([a]ccept / [s]kip / type feedback): ');
+      const trimmed = answer.trim().toLowerCase();
+
+      // Get current HEAD SHA for persistence
+      let headSha = pr.uniqueHeadSha;
+      if (!headSha) {
+        try {
+          headSha = execSync(
+            `gh api repos/${pr.repo}/pulls/${pr.number} --jq .head.sha`,
+            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          ).trim();
+        } catch { headSha = ''; }
+      }
+
+      if (trimmed === 's' || trimmed === 'skip') {
+        newDecisions.push({ pr, action: 'skip' });
+        setTriageDecision(forgeRoot, pr.repo, pr.number, 'skip', headSha);
+        console.log(chalk.dim('  → Skipped\n'));
+      } else if (trimmed === 'a' || trimmed === 'accept' || trimmed === '') {
+        newDecisions.push({ pr, action: 'accept' });
+        setTriageDecision(forgeRoot, pr.repo, pr.number, 'accept', headSha);
+        console.log(chalk.green('  → Accepted\n'));
+      } else {
+        const feedback = answer.trim();
+        newDecisions.push({ pr, action: 'feedback', feedback });
+        setTriageDecision(forgeRoot, pr.repo, pr.number, 'feedback', headSha, feedback);
+        console.log(chalk.green('  → Accepted with feedback\n'));
+      }
+    }
+  } finally {
+    standalone?.cleanup();
+  }
+
+  const allDecisions = [...autoIncluded, ...newDecisions];
+
+  // Summary
+  const accepted = allDecisions.filter((d) => d.action !== 'skip').length;
+  const skipped = allDecisions.filter((d) => d.action === 'skip').length;
+  console.log(chalk.bold(`  Triage complete: ${accepted} to review, ${skipped} skipped\n`));
+
+  return allDecisions;
 }

@@ -28,7 +28,10 @@ export interface ForgeSettings {
   /** Root workspace directory containing all projects */
   readonly workspaceRoot: string;
 
-  /** Directories to treat as managed projects (relative to workspace root) */
+  /** Subdirectory containing managed projects (relative to workspace root) */
+  readonly projectsDir: string;
+
+  /** Project names (resolved as projectsDir/<name>) */
   readonly projects: readonly string[];
 
   /** Default Claude model for each agent role */
@@ -80,6 +83,7 @@ const DEFAULT_PHASE_CONCURRENCY: PhaseConcurrency = {
 
 const DEFAULT_SETTINGS: ForgeSettings = {
   workspaceRoot: '/home/parso/sideProjects',
+  projectsDir: 'projects',
   projects: ['trafficGame', 'simplarr', 'env-optimiser', 'GitWeave'],
   models: {
     architect: 'sonnet',      // Design needs strong reasoning
@@ -138,4 +142,12 @@ export function loadSettings(workspaceRoot?: string): ForgeSettings {
   }
 
   return { ...DEFAULT_SETTINGS, workspaceRoot: root };
+}
+
+/**
+ * Resolve a project name to its full filesystem path.
+ * Uses projectsDir to locate projects within the workspace.
+ */
+export function resolveProjectPath(settings: ForgeSettings, projectName: string): string {
+  return resolve(settings.workspaceRoot, settings.projectsDir, projectName);
 }

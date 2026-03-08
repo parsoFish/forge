@@ -35,13 +35,24 @@ import { resolve } from 'node:path';
 import { Orchestrator } from './orchestrator.js';
 import { Worker } from './jobs/index.js';
 import { EventLog } from './events/index.js';
+import { Session } from './session/index.js';
 
 const program = new Command();
 
 program
   .name('forge')
   .description('Autonomous multi-agent orchestrator — a lead engineer for your codebase')
-  .version('0.3.0');
+  .version('0.3.0')
+  .action(async () => {
+    // No subcommand → start interactive session
+    try {
+      const session = new Session();
+      await session.start();
+    } catch (error) {
+      console.error(chalk.red('Session error:'), error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
 
 // ═══════════════════════════════════════════════════════════════════
 // Job-posting commands (non-blocking)
@@ -114,6 +125,19 @@ program
       }
       const orch = new Orchestrator();
       await orch.fix(prNumber, opts.project);
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('fix-all [project]')
+  .description('Queue fix jobs for ALL open PRs — starts the autonomous review/fix loop for each')
+  .action(async (project?: string) => {
+    try {
+      const orch = new Orchestrator();
+      await orch.fixAll(project);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
       process.exit(1);
