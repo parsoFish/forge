@@ -1,4 +1,5 @@
 {
+  "projectsDir": "projects",
   "models": {
     "architect": "claude-opus-4-6",
     "planner": "claude-sonnet-4-6",
@@ -15,11 +16,17 @@
     "maxWeeklyBudgetUsd": 2000,
     "warnAtPercent": 75
   },
-  "maxConcurrency": 5,
+  "maxConcurrency": 4,
   "phaseConcurrency": {
     "designPlan": 2,
     "test": 2,
-    "develop": 2,
-    "prReview": 3
+    "develop": 3,
+    "prReview": 2
+  },
+  "resourceThresholds": {
+    "minAvailableMemoryMb": 2000,
+    "resourceSlots": {
+      "build": { "capacity": 3 }
+    }
   }
 }

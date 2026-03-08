@@ -85,10 +85,11 @@ npm start              # Run orchestrator CLI
 │   ├── work-items/         # Active work item tracking
 │   ├── decisions.md        # Agent decision log
 │   └── research/           # Research agent findings
-├── trafficGame/            # Managed project
-├── simplarr/               # Managed project
-├── env-optimiser/          # Managed project
-└── GitWeave/               # Managed project
+└── projects/               # Managed projects (git submodules)
+    ├── trafficGame/
+    ├── simplarr/
+    ├── env-optimiser/
+    └── GitWeave/
 ```
 
 ## Key Files
