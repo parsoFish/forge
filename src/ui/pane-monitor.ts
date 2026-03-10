@@ -11,8 +11,8 @@ import chalk from 'chalk';
 import { resolve } from 'node:path';
 import { readWorkerStatus } from './worker-status-file.js';
 import { loadSettings } from '../config/index.js';
-
-const REFRESH_MS = 2_000;
+import { getAdaptiveIntervalMs } from './render-throttle.js';
+import { DiffRenderer } from './diff-renderer.js';
 
 function bar(ratio: number, width = 12): string {
   const filled = Math.round(ratio * width);
@@ -21,18 +21,17 @@ function bar(ratio: number, width = 12): string {
   return color('█'.repeat(filled)) + chalk.dim('░'.repeat(empty));
 }
 
-function render(forgeRoot: string): void {
+function buildLines(forgeRoot: string): string[] {
   const status = readWorkerStatus(forgeRoot);
+  const lines: string[] = [];
 
-  process.stdout.write('\x1b[H\x1b[2J');
-
-  console.log(chalk.bold(' MONITOR') + chalk.dim('  ' + new Date().toLocaleTimeString()));
-  console.log(chalk.dim(' ─'.repeat(20)));
+  lines.push(chalk.bold(' MONITOR') + chalk.dim('  ' + new Date().toLocaleTimeString()));
+  lines.push(chalk.dim(' ─'.repeat(20)));
 
   if (!status) {
-    console.log(chalk.dim('  Worker: ') + chalk.red.bold('OFF'));
-    console.log(chalk.dim('  Use /worker on in the main pane'));
-    return;
+    lines.push(chalk.dim('  Worker: ') + chalk.red.bold('OFF'));
+    lines.push(chalk.dim('  Use /worker on in the main pane'));
+    return lines;
   }
 
   const stateColor = {
@@ -43,16 +42,16 @@ function render(forgeRoot: string): void {
   }[status.state] ?? chalk.dim;
 
   // Worker state + jobs on one compact block
-  console.log(chalk.dim('  Worker  ') + stateColor(status.state.toUpperCase()));
+  lines.push(chalk.dim('  Worker  ') + stateColor(status.state.toUpperCase()));
 
   if (status.state === 'rate-limited' && status.rateLimitResetAt) {
     const waitSec = Math.max(0, Math.ceil((status.rateLimitResetAt - Date.now()) / 1000));
-    console.log(chalk.dim('  Resets  ') + chalk.yellow(`${waitSec}s`));
+    lines.push(chalk.dim('  Resets  ') + chalk.yellow(`${waitSec}s`));
   }
 
   // Jobs — single line
   const failStr = status.queue.failed > 0 ? chalk.red(` ${status.queue.failed}✗`) : '';
-  console.log(chalk.dim('  Jobs    ') +
+  lines.push(chalk.dim('  Jobs    ') +
     chalk.white.bold(String(status.activeJobs)) + chalk.dim(' run') +
     chalk.dim(' / ') + chalk.white(String(status.queue.queued)) + chalk.dim(' queue') +
     chalk.dim(' / ') + chalk.green(String(status.processedCount)) + chalk.dim(' done') + failStr
@@ -62,7 +61,7 @@ function render(forgeRoot: string): void {
   if (status.concurrency) {
     const c = status.concurrency;
     const smoothCpu = (c.smoothedCpuLoad * 100).toFixed(0);
-    console.log(chalk.dim('  Scale ') +
+    lines.push(chalk.dim('  Scale ') +
       chalk.white.bold(String(c.current)) + chalk.dim('/') +
       chalk.cyan(String(c.target)) + chalk.dim(` (max ${c.ceiling})`) +
       chalk.dim(`  avg CPU ${smoothCpu}%`));
@@ -72,11 +71,11 @@ function render(forgeRoot: string): void {
   const cpuPct = (status.resources.cpuLoadFactor * 100).toFixed(0);
   const memPct = (status.resources.memoryUsagePercent * 100).toFixed(0);
   const memFree = status.resources.availableMemoryMb.toFixed(0);
-  console.log(chalk.dim('  CPU   ') + bar(status.resources.cpuLoadFactor) + ` ${cpuPct}%`);
-  console.log(chalk.dim('  Mem   ') + bar(status.resources.memoryUsagePercent) + ` ${memPct}% (${memFree}MB)`);
+  lines.push(chalk.dim('  CPU   ') + bar(status.resources.cpuLoadFactor) + ` ${cpuPct}%`);
+  lines.push(chalk.dim('  Mem   ') + bar(status.resources.memoryUsagePercent) + ` ${memPct}% (${memFree}MB)`);
 
   if (!status.resources.healthy && status.resources.reason) {
-    console.log(chalk.red(`  ⚠ ${status.resources.reason.slice(0, 50)}`));
+    lines.push(chalk.red(`  ⚠ ${status.resources.reason.slice(0, 50)}`));
   }
 
   // Slots — inline, only show if any are in use
@@ -84,24 +83,46 @@ function render(forgeRoot: string): void {
   const usedSlots = slots.filter(([, { used }]) => used > 0);
   if (usedSlots.length > 0) {
     const slotStr = usedSlots.map(([name, { used, capacity }]) => `${name}:${used}/${capacity}`).join(' ');
-    console.log(chalk.dim('  Slots ') + slotStr);
+    lines.push(chalk.dim('  Slots ') + slotStr);
   }
 
   // API-equivalent cost — does NOT reflect actual plan usage.
   // Subscriptions meter by tokens/requests, not dollars.
-  console.log(chalk.dim('  API~  ') + chalk.dim(status.budget.summary));
-  console.log(chalk.dim('        ') + chalk.dim.italic('est. cost, not plan usage'));
+  lines.push(chalk.dim('  API~  ') + chalk.dim(status.budget.summary));
+  lines.push(chalk.dim('        ') + chalk.dim.italic('est. cost, not plan usage'));
+
+  return lines;
 }
 
 export function startMonitorPane(workspaceRoot?: string): void {
   const settings = loadSettings(workspaceRoot);
   const forgeRoot = resolve(settings.workspaceRoot, '.forge');
 
+  const rows = process.stdout.rows ?? 24;
+  const cols = process.stdout.columns ?? 40;
+  const diffRenderer = new DiffRenderer(rows, cols, (data) => process.stdout.write(data));
+
   process.stdout.write('\x1b[?25l');
   process.on('exit', () => process.stdout.write('\x1b[?25h'));
   process.on('SIGINT', () => { process.stdout.write('\x1b[?25h'); process.exit(0); });
   process.on('SIGTERM', () => { process.stdout.write('\x1b[?25h'); process.exit(0); });
 
-  render(forgeRoot);
-  setInterval(() => render(forgeRoot), REFRESH_MS);
+  const renderFrame = (): void => {
+    const currentRows = process.stdout.rows ?? 24;
+    const currentCols = process.stdout.columns ?? 40;
+    diffRenderer.resize(currentRows, currentCols);
+
+    diffRenderer.render(buildLines(forgeRoot));
+  };
+
+  const scheduleNextRender = (): void => {
+    const interval = getAdaptiveIntervalMs();
+    setTimeout(() => {
+      renderFrame();
+      scheduleNextRender();
+    }, interval);
+  };
+
+  renderFrame();
+  scheduleNextRender();
 }

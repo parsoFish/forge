@@ -8,6 +8,8 @@
  * Format per running agent:
  *   [role] project — action — output — 2m30s
  *
+ * Render interval adapts to system memory pressure (2s-15s).
+ *
  * WHY tail events instead of reading job files:
  * Events contain agent.spawn, agent.output, agent.result — the full
  * lifecycle. Job files only have status. Events give us the "what is
@@ -18,9 +20,10 @@ import chalk from 'chalk';
 import { resolve } from 'node:path';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { loadSettings } from '../config/index.js';
+import { getAdaptiveIntervalMs } from './render-throttle.js';
+import { DiffRenderer } from './diff-renderer.js';
 import type { ForgeEvent } from '../events/event-log.js';
 
-const REFRESH_MS = 2_000;
 const MAX_COMPLETED = 3;
 
 interface ActiveAgent {
@@ -46,9 +49,14 @@ class ActionsPane {
   private readonly activeAgents = new Map<string, ActiveAgent>();
   private readonly completed: CompletedEntry[] = [];
   private termWidth = 40;
+  private diffRenderer: DiffRenderer;
 
   constructor(forgeRoot: string) {
     this.eventsPath = resolve(forgeRoot, 'events.jsonl');
+
+    const rows = process.stdout.rows ?? 24;
+    const cols = process.stdout.columns ?? 40;
+    this.diffRenderer = new DiffRenderer(rows, cols, (data) => process.stdout.write(data));
   }
 
   /** Read new events since last check by tracking file position. */
@@ -204,22 +212,19 @@ class ActionsPane {
     return s.length > max ? s.slice(0, max - 1) + '…' : s;
   }
 
-  render(): void {
-    const events = this.readNewEvents();
-    this.processEvents(events);
-
+  private buildLines(): string[] {
     // Detect available width for content truncation
     this.termWidth = process.stdout.columns ?? 40;
     const contentWidth = this.termWidth - 4; // 2 indent + 2 margin
 
-    process.stdout.write('\x1b[H\x1b[2J');
+    const lines: string[] = [];
 
-    console.log(chalk.bold(' AGENTS') + chalk.dim(`  ${this.activeAgents.size} running`));
-    console.log(chalk.dim(' ' + '─'.repeat(Math.min(contentWidth, 35))));
+    lines.push(chalk.bold(' AGENTS') + chalk.dim(`  ${this.activeAgents.size} running`));
+    lines.push(chalk.dim(' ' + '─'.repeat(Math.min(contentWidth, 35))));
 
     if (this.activeAgents.size === 0 && this.completed.length === 0) {
-      console.log(chalk.dim('  Waiting for agents...'));
-      return;
+      lines.push(chalk.dim('  Waiting for agents...'));
+      return lines;
     }
 
     // Active agents — one live-updating line per agent
@@ -230,27 +235,49 @@ class ActionsPane {
       const duration = chalk.yellow(this.formatDuration(agent.startedAt));
 
       // Line 1: role, project, duration
-      console.log(`  ${role}${project} ${chalk.dim('—')} ${duration}`);
+      lines.push(`  ${role}${project} ${chalk.dim('—')} ${duration}`);
 
       // Line 2: current action + output (indented)
       const action = this.truncate(agent.lastAction, contentWidth - 4);
-      const output = agent.lastOutput
+      const agentOutput = agent.lastOutput
         ? chalk.dim(this.truncate(agent.lastOutput, contentWidth - action.length - 6))
         : '';
-      console.log(chalk.dim(`    ${action}`) + (output ? ` ${output}` : ''));
+      lines.push(chalk.dim(`    ${action}`) + (agentOutput ? ` ${agentOutput}` : ''));
     }
 
     // Completed — 3 recent with commit-style summaries
     if (this.completed.length > 0) {
-      if (this.activeAgents.size > 0) console.log(); // spacer
-      console.log(chalk.dim('  Recent:'));
+      if (this.activeAgents.size > 0) lines.push(''); // spacer
+      lines.push(chalk.dim('  Recent:'));
       for (const entry of this.completed) {
         const project = entry.project ? chalk.dim(`${entry.project} `) : '';
         const dur = this.formatDurationMs(entry.durationMs);
         const summary = this.truncate(entry.summary, contentWidth - 12);
-        console.log(`  ${project}${chalk.dim(summary)} ${chalk.dim(`(${dur})`)}`);
+        lines.push(`  ${project}${chalk.dim(summary)} ${chalk.dim(`(${dur})`)}`);
       }
     }
+
+    return lines;
+  }
+
+  render(): void {
+    const events = this.readNewEvents();
+    this.processEvents(events);
+
+    // Handle terminal resize
+    const rows = process.stdout.rows ?? 24;
+    const cols = process.stdout.columns ?? 40;
+    this.diffRenderer.resize(rows, cols);
+
+    this.diffRenderer.render(this.buildLines());
+  }
+
+  private scheduleNextRender(): void {
+    const interval = getAdaptiveIntervalMs();
+    setTimeout(() => {
+      this.render();
+      this.scheduleNextRender();
+    }, interval);
   }
 
   start(): void {
@@ -268,7 +295,7 @@ class ActionsPane {
     this.processEvents(seedEvents);
 
     this.render();
-    setInterval(() => this.render(), REFRESH_MS);
+    this.scheduleNextRender();
   }
 }
 

@@ -1,13 +1,15 @@
 /**
  * Job queue pane — live job queue display with priority bumping.
  *
- * Reads `.forge/jobs/*.json` every 2s and renders:
+ * Reads `.forge/jobs/*.json` and renders:
  *   - Jobs sorted by priority (lowest number = highest priority)
  *   - Dependencies between jobs
  *   - Status indicators
  *
+ * Render interval adapts to system memory pressure (2s-15s).
+ *
  * Keyboard controls:
- *   ↑/↓  Select a job
+ *   up/down  Select a job
  *   +/-  Bump priority up/down (validates against dependencies)
  *   q    Quit
  *
@@ -19,9 +21,9 @@ import { resolve, join } from 'node:path';
 import { writeFileSync } from 'node:fs';
 import { loadSettings } from '../config/index.js';
 import { JobQueue } from '../jobs/queue.js';
+import { getAdaptiveIntervalMs } from './render-throttle.js';
+import { DiffRenderer } from './diff-renderer.js';
 import type { Job } from '../jobs/types.js';
-
-const REFRESH_MS = 2_000;
 
 const STATUS_ICON: Record<string, string> = {
   queued:    chalk.yellow('◦'),
@@ -47,13 +49,18 @@ class QueuePane {
   private readonly jobsDir: string;
   private selectedIndex = 0;
   private jobs: Job[] = [];
+  private diffRenderer: DiffRenderer;
 
   constructor(forgeRoot: string) {
     this.queue = new JobQueue(forgeRoot);
     this.jobsDir = join(forgeRoot, 'jobs');
+
+    const rows = process.stdout.rows ?? 24;
+    const cols = process.stdout.columns ?? 30;
+    this.diffRenderer = new DiffRenderer(rows, cols, (data) => process.stdout.write(data));
   }
 
-  render(): void {
+  private buildLines(): string[] {
     this.jobs = this.queue.all()
       .filter((j) => j.status === 'queued' || j.status === 'running')
       .sort((a, b) => {
@@ -66,17 +73,16 @@ class QueuePane {
     // Clamp selection
     if (this.selectedIndex >= this.jobs.length) this.selectedIndex = Math.max(0, this.jobs.length - 1);
 
-    process.stdout.write('\x1b[H\x1b[2J');
-
     const w = process.stdout.columns ?? 30;
     const lineW = Math.min(w - 2, 35);
+    const lines: string[] = [];
 
-    console.log(chalk.bold(' QUEUE') + chalk.dim(` ${this.jobs.length}`));
-    console.log(chalk.dim(' ' + '─'.repeat(lineW)));
+    lines.push(chalk.bold(' QUEUE') + chalk.dim(` ${this.jobs.length}`));
+    lines.push(chalk.dim(' ' + '─'.repeat(lineW)));
 
     if (this.jobs.length === 0) {
-      console.log(chalk.dim('  Empty'));
-      return;
+      lines.push(chalk.dim('  Empty'));
+      return lines;
     }
 
     for (let i = 0; i < this.jobs.length; i++) {
@@ -88,10 +94,20 @@ class QueuePane {
       const age = formatAge(job.startedAt ?? job.createdAt);
 
       const line = ` ${icon} ${type} ${project} ${age}`;
-      console.log(selected ? chalk.bgWhite.black(line) : line);
+      lines.push(selected ? chalk.bgWhite.black(line) : line);
     }
 
-    console.log(chalk.dim(' ↑↓ +/- q'));
+    lines.push(chalk.dim(' ↑↓ +/- q'));
+    return lines;
+  }
+
+  render(): void {
+    // Handle terminal resize
+    const rows = process.stdout.rows ?? 24;
+    const cols = process.stdout.columns ?? 30;
+    this.diffRenderer.resize(rows, cols);
+
+    this.diffRenderer.render(this.buildLines());
   }
 
   handleKey(key: Buffer): void {
@@ -136,6 +152,14 @@ class QueuePane {
     this.render();
   }
 
+  private scheduleNextRender(): void {
+    const interval = getAdaptiveIntervalMs();
+    setTimeout(() => {
+      this.render();
+      this.scheduleNextRender();
+    }, interval);
+  }
+
   start(): void {
     // Hide cursor
     process.stdout.write('\x1b[?25l');
@@ -151,7 +175,7 @@ class QueuePane {
     }
 
     this.render();
-    setInterval(() => this.render(), REFRESH_MS);
+    this.scheduleNextRender();
   }
 }
 
