@@ -2046,11 +2046,18 @@ Your final line MUST be one of:
 
         // Don't double-queue if a fix or review job already exists for this PR
         const existing = this.queue.all().find(
-          (j) => (j.type === 'pr-fix' || j.type === 'review')
-            && j.metadata.prNumber === pr.number
+          (j) => (j.type === 'pr-fix' || j.type === 'review' || j.type === 'work-item')
+            && (j.metadata.prNumber === pr.number || (typeof j.metadata.workItemId === 'string' && j.metadata.workItemId.includes(`close-out-pr-${pr.number}`)))
             && (j.status === 'queued' || j.status === 'running'),
         );
         if (existing) continue;
+
+        // Skip PRs with active close-out items — those go through the close-out
+        // pipeline (dependency chain, requeueDependentCloseOuts), not standalone fixes.
+        const hasCloseOut = this.store.getWorkItemsByProject(pr.project)
+          .some((wi) => wi.closeOut?.prNumber === pr.number
+            && (wi.status === 'pending' || wi.status === 'in-progress' || wi.status === 'blocked'));
+        if (hasCloseOut) continue;
 
         this.queue.post('pr-fix', 'review', pr.project, {
           prNumber: pr.number,
@@ -2097,7 +2104,40 @@ Your final line MUST be one of:
       });
     }
 
-    // 4. Queue newly-unblocked work items
+    // 4. Recover stale in-progress close-out items
+    // If a close-out item is in-progress but no job exists for it (crash/restart),
+    // reset it to pending so step 5 can re-queue it. Without this, close-out items
+    // orphaned by crashes stay in-progress forever.
+    let recoveredCount = 0;
+    for (const project of this.settings.projects) {
+      const items = this.store.getWorkItemsByProject(project);
+      const staleCloseOuts = items.filter(
+        (i) => i.closeOut && i.status === 'in-progress',
+      );
+
+      for (const item of staleCloseOuts) {
+        const hasJob = this.queue.all().some(
+          (j) => (j.type === 'work-item' || j.type === 'pr-fix' || j.type === 'review')
+            && (j.metadata.workItemId === item.id || j.metadata.prNumber === item.closeOut?.prNumber)
+            && (j.status === 'queued' || j.status === 'running'),
+        );
+        if (!hasJob) {
+          item.status = 'pending';
+          item.updatedAt = new Date().toISOString();
+          this.store.saveWorkItem(item);
+          recoveredCount++;
+        }
+      }
+    }
+    if (recoveredCount > 0) {
+      console.log(chalk.yellow(`  ♻ Heartbeat: recovered ${recoveredCount} stale in-progress close-out item(s)`));
+      this.eventLog.emit({
+        type: 'heartbeat.retry' as import('../events/event-log.js').EventType,
+        summary: `Recovered ${recoveredCount} stale close-out item(s) from in-progress → pending`,
+      });
+    }
+
+    // 5. Queue newly-unblocked work items
     let queuedCount = 0;
     for (const project of this.settings.projects) {
       const items = this.store.getWorkItemsByProject(project);
