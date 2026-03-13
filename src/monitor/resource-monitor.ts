@@ -54,6 +54,11 @@ export interface HealthCheck {
   readonly reason?: string;
   /** Snapshot of slot usage at check time */
   readonly slots: Readonly<Record<string, { used: number; capacity: number }>>;
+  /** Memory Pressure Stall Information (null if unavailable) */
+  readonly psi?: {
+    readonly someAvg10: number;
+    readonly fullAvg10: number;
+  };
 }
 
 export const DEFAULT_RESOURCE_SLOTS: Readonly<Record<string, ResourceSlotConfig>> = {
@@ -101,6 +106,31 @@ export interface TuningReport {
   readonly healthySamples: number;
   readonly totalSamples: number;
   readonly slotMetrics: Readonly<Record<string, SlotMetrics>>;
+}
+
+/**
+ * Read memory Pressure Stall Information from /proc/pressure/memory.
+ *
+ * PSI measures actual memory contention — how much time tasks spend waiting
+ * for memory. This is more accurate than MemAvailable for WSL2, where the
+ * VM's memory allocation is dynamic and MemAvailable reflects VM capacity,
+ * not actual host pressure.
+ *
+ * Returns null if PSI is unavailable (older kernels or non-Linux).
+ */
+function readPSI(): { someAvg10: number; fullAvg10: number } | null {
+  try {
+    const content = readFileSync('/proc/pressure/memory', 'utf-8');
+    const someLine = content.match(/some avg10=(\d+\.\d+)/);
+    const fullLine = content.match(/full avg10=(\d+\.\d+)/);
+    if (!someLine || !fullLine) return null;
+    return {
+      someAvg10: parseFloat(someLine[1]),
+      fullAvg10: parseFloat(fullLine[1]),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -305,6 +335,15 @@ export class ResourceMonitor {
       }
     }
 
+    // Read PSI (Pressure Stall Information) for WSL2-accurate memory pressure
+    const psi = readPSI();
+    if (psi && psi.fullAvg10 > 25) {
+      // >25% full stall = severe memory pressure even if MemAvailable looks OK
+      healthy = false;
+      const psiReason = `Memory pressure high: PSI full=${psi.fullAvg10.toFixed(1)}% (>25% threshold)`;
+      reason = reason ? `${reason}; ${psiReason}` : psiReason;
+    }
+
     if (healthy) this.healthySampleCount++;
 
     this.lastCheck = {
@@ -315,6 +354,7 @@ export class ResourceMonitor {
       coreCount,
       reason,
       slots,
+      psi: psi ? { someAvg10: psi.someAvg10, fullAvg10: psi.fullAvg10 } : undefined,
     };
     this.lastCheckTime = now;
 

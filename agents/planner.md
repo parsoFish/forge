@@ -60,6 +60,18 @@ A JSON array of work items, each with:
 - `acceptanceCriteria`: Array of Given-When-Then strings
 - `qualityChecklist`: Array of verification steps
 
+## Branch Isolation Rule
+
+Each work item MUST produce changes on its own branch that do NOT include files belonging to other work items. Cross-contaminated branches (where the same generated files appear in multiple PRs) create merge conflicts, circular dependencies, and block autonomous close-out.
+
+- If a shared utility, module, or base class needs extraction, that extraction is its **own work item** that others depend on.
+- The planner must identify shared code extractions as separate, earlier work items with explicit `dependsOn` entries.
+- A work item's branch should contain ONLY files relevant to that item's stated concern.
+
+**Example:**
+- BAD: Three work items all create `src/utils/helpers.ts` independently
+- GOOD: Work item 1 creates `src/utils/helpers.ts`, items 2-3 depend on item 1 and import from it
+
 ## Rules
 
 - Do NOT create work items for vague ideas. Every item must be concrete and implementable.

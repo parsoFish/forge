@@ -16,6 +16,8 @@
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { writeFileSync as writeFs } from 'node:fs';
+import { join as joinPath } from 'node:path';
 import chalk from 'chalk';
 import type { AgentInvocation, AgentResult } from './types.js';
 import type { EventLog } from '../events/event-log.js';
@@ -358,6 +360,18 @@ export class AgentRun extends EventEmitter {
       detached: false,
     });
 
+    // Place process in cgroup for memory isolation (if provided by worker)
+    if (this.invocation.cgroupPath && this.process.pid) {
+      try {
+        writeFs(
+          joinPath(this.invocation.cgroupPath, 'cgroup.procs'),
+          String(this.process.pid),
+        );
+      } catch {
+        // Cgroup placement failed — non-fatal, process runs without limits
+      }
+    }
+
     // Log spawn to global event log
     globalEventLog?.emit({
       type: 'agent.spawn',
@@ -447,14 +461,8 @@ export class AgentRun extends EventEmitter {
             for (const block of chunk.message.content) {
               if (block.type === 'text' && block.text) {
                 this.emit('text', { text: block.text });
-                globalEventLog?.writeRunLog(this.runId, { type: 'text', text: block.text.slice(0, 500) });
-                // Emit to global event log so the actions pane shows live output excerpts
-                globalEventLog?.emit({
-                  type: 'agent.output',
-                  agentRole: this.agentRole,
-                  runId: this.runId,
-                  summary: block.text.slice(0, 120),
-                });
+                // Per-run log only — NOT global events (async stream, low overhead)
+                globalEventLog?.writeRunLog(this.runId, { type: 'text', text: block.text });
               }
               if (block.type === 'tool_use' && block.name) {
                 const toolData = {
@@ -464,6 +472,8 @@ export class AgentRun extends EventEmitter {
                 this.emit('tool_use', toolData);
                 const detail = extractToolDetail(block.name, block.input);
                 liveTracker.updateTool(this.runId, block.name, detail);
+                // Tool use events go to both global (for actions pane) and per-run log.
+                // Safe now that global events are buffered (500ms batch flush).
                 globalEventLog?.emit({
                   type: 'agent.tool_use',
                   agentRole: this.agentRole,

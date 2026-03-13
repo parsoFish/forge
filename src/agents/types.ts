@@ -71,4 +71,7 @@ export interface AgentInvocation {
 
   /** Additional context to inject */
   readonly context?: string;
+
+  /** Optional cgroup path for process isolation. Set by the worker. */
+  readonly cgroupPath?: string;
 }
