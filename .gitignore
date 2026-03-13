@@ -11,6 +11,10 @@ projects/
 # Personal config — use forge.config.example.json as template
 forge.config.json
 
+# MCP config with secrets — use .mcp.json.example as template
+.mcp.json
+.env.mcp
+
 # IDE and editor files
 .claude/
 .vscode/

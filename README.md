@@ -22,9 +22,9 @@ Roadmap → Implement → Review → Merge → Reflect → Loop
 | Phase | Mode | Model | What Happens |
 |-------|------|-------|-------------|
 | **Roadmap** | Interactive | Opus | Human sets direction, agent produces design briefs |
-| **Implement** | Autonomous | Sonnet | Plan → TDD → develop → test cycle |
+| **Implement** | Autonomous | Sonnet/Haiku | Plan → TDD → develop → test cycle |
 | **Review** | Interactive | Sonnet | PR triage, deep review, human approval |
-| **Merge** | Autonomous | — | Fix review feedback, resolve conflicts, merge |
+| **Merge** | Autonomous | Sonnet/Haiku | Fix review feedback, resolve conflicts, merge |
 | **Reflect** | Interactive | Opus | Analyze outcomes, extract learnings |
 
 Phases transition explicitly. Agents run autonomously between human touchpoints.
@@ -167,6 +167,42 @@ forge/
 | Reflector | Outcome analysis and learning extraction | Sonnet |
 
 Agent definitions live in `agents/*.md` — each is a markdown prompt with YAML frontmatter specifying name, role, tools, and description.
+
+## Process Isolation (Optional)
+
+Forge can use cgroups v2 to enforce memory limits on agent subprocesses, preventing a runaway build or test from OOM-killing the orchestrator. Without this, forge runs fine but in "fallback mode" without kernel-enforced limits.
+
+### WSL2 Setup
+
+WSL2 has cgroups v2 support but needs delegation enabled for your user:
+
+```bash
+# 1. Enable cgroup delegation for your user (one-time, requires sudo)
+sudo mkdir -p /etc/systemd/system/user@$(id -u).service.d
+sudo tee /etc/systemd/system/user@$(id -u).service.d/delegate.conf > /dev/null << 'EOF'
+[Service]
+Delegate=cpu memory io pids
+EOF
+sudo systemctl daemon-reload
+
+# 2. Restart WSL to apply (from PowerShell)
+wsl --shutdown
+```
+
+After restart, verify with:
+```bash
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers
+# Should include: cpu io memory pids
+```
+
+If forge still shows "cgroups unavailable", the process may need to run within the user slice. Launch via:
+```bash
+systemd-run --user --scope -p Delegate=yes forge
+```
+
+### Native Linux
+
+Most modern distros with systemd 245+ delegate cgroups to user sessions automatically. If not, apply the same delegation config above.
 
 ## Development
 
