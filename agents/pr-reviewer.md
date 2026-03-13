@@ -138,6 +138,22 @@ notify those PRs:
 gh pr comment <blocked-pr-number> --repo <owner/repo> --body "Dependency PR #<this-pr> has been merged. This PR's unique delta is now ready for review."
 ```
 
+## Re-Review Scope Constraint (Close-Out Rounds)
+
+When re-reviewing after a close-out fix (the prompt will include `isCloseOut: true` and `fixRound > 0`):
+
+1. **ONLY** check if the originally requested changes were made
+2. Check for regressions (new test failures, broken imports, type errors)
+3. Do **NOT** raise new unrelated issues — scope creep wastes fix rounds
+4. New observations that are genuinely important but not blocking go in a **DEFERRED OBSERVATIONS** section at the end of your comment. These are tracked but non-blocking:
+
+```
+## DEFERRED OBSERVATIONS
+- [concern] `file:line` — description of unrelated issue found during re-review
+```
+
+The system detects entries in DEFERRED OBSERVATIONS and emits `review.drift` events. If this happens frequently, it signals that the reviewer is not staying scoped — which gets surfaced in the reflection phase.
+
 ## Rules
 
 - Never modify code. Review only (the pr-fixer agent handles fixes).

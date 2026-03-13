@@ -64,6 +64,63 @@ export interface OpenPR {
   chainMembers?: number[];
 }
 
+/** File ownership map — which PRs touch which files, and which files overlap. */
+export interface FileOwnershipMap {
+  /** file path → PR numbers that modify it */
+  readonly fileOwners: ReadonlyMap<string, readonly number[]>;
+  /** Only files modified by 2+ PRs */
+  readonly overlappingFiles: ReadonlyMap<string, readonly number[]>;
+  /** PR number → files it modifies */
+  readonly prFiles: ReadonlyMap<number, readonly string[]>;
+}
+
+/**
+ * Build a file ownership map by fetching changed files for each PR.
+ *
+ * WHY: Cross-PR file overlap is invisible to the commit-graph dependency
+ * detector. When multiple PRs independently modify the same files (common
+ * in implementation cycles), the reviewer needs to know so it doesn't
+ * flag shared files as "unrelated to this PR."
+ */
+export function buildFileOwnershipMap(prs: readonly OpenPR[], cwd: string): FileOwnershipMap {
+  const fileOwners = new Map<string, number[]>();
+  const prFiles = new Map<number, string[]>();
+
+  for (const pr of prs) {
+    try {
+      const raw = execSync(
+        `gh pr view ${pr.number} --repo ${pr.repo} --json files --jq '.files[].path'`,
+        { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      ).trim();
+
+      const files = raw ? raw.split('\n').filter(Boolean) : [];
+      prFiles.set(pr.number, files);
+
+      for (const file of files) {
+        const owners = fileOwners.get(file) ?? [];
+        owners.push(pr.number);
+        fileOwners.set(file, owners);
+      }
+    } catch {
+      prFiles.set(pr.number, []);
+    }
+  }
+
+  // Filter to only overlapping files (touched by 2+ PRs)
+  const overlappingFiles = new Map<string, readonly number[]>();
+  for (const [file, owners] of fileOwners) {
+    if (owners.length > 1) {
+      overlappingFiles.set(file, [...owners]);
+    }
+  }
+
+  return {
+    fileOwners: new Map([...fileOwners].map(([k, v]) => [k, [...v]])),
+    overlappingFiles,
+    prFiles: new Map([...prFiles].map(([k, v]) => [k, [...v]])),
+  };
+}
+
 /**
  * Analyse the git commit graph to detect stacked-branch dependencies between PRs.
  *
@@ -181,6 +238,77 @@ function buildMergeOrder(prs: OpenPR[], cwd: string): OpenPR[] {
       chainMembers.set(tip.number, chain);
       for (const member of chain) {
         chainTip.set(member, tip.number);
+      }
+    }
+  }
+
+  // ── File-overlap fallback ────────────────────────────────────────
+  // When commit-graph analysis finds no stacking (all layer 0), use
+  // file overlap as a secondary signal for merge ordering. PRs that
+  // share files with many others should merge first (foundation) so
+  // subsequent merges resolve conflicts against an updated main.
+  const allLayerZero = prs.every((pr) => (layers.get(pr.number) ?? 0) === 0);
+  if (allLayerZero && prs.length > 1) {
+    const fileMap = buildFileOwnershipMap(prs, cwd);
+
+    if (fileMap.overlappingFiles.size > 0) {
+      // Score each PR by how many overlapping files it touches
+      const overlapScore = new Map<number, number>();
+      for (const pr of prs) {
+        let score = 0;
+        for (const file of fileMap.prFiles.get(pr.number) ?? []) {
+          const owners = fileMap.overlappingFiles.get(file);
+          if (owners && owners.length > 1) score++;
+        }
+        overlapScore.set(pr.number, score);
+      }
+
+      // Sort by overlap score descending — highest overlap merges first
+      const sorted = [...prs].sort((a, b) =>
+        (overlapScore.get(b.number) ?? 0) - (overlapScore.get(a.number) ?? 0),
+      );
+
+      // Assign layers: highest-overlap PR = layer 0, next batch = layer 1, etc.
+      // PRs with zero overlap stay at layer 0 (truly independent).
+      let currentLayer = 0;
+      let prevScore = overlapScore.get(sorted[0].number) ?? 0;
+
+      for (const pr of sorted) {
+        const score = overlapScore.get(pr.number) ?? 0;
+        if (score === 0) {
+          // No overlapping files — independent, stays layer 0
+          layers.set(pr.number, 0);
+        } else {
+          if (score < prevScore) currentLayer++;
+          layers.set(pr.number, currentLayer);
+          prevScore = score;
+        }
+      }
+
+      // Build dependency edges from layer ordering (higher layers depend on lower)
+      for (const pr of prs) {
+        const prLayer = layers.get(pr.number) ?? 0;
+        if (prLayer === 0) continue;
+
+        for (const other of prs) {
+          if (other.number === pr.number) continue;
+          const otherLayer = layers.get(other.number) ?? 0;
+          if (otherLayer < prLayer) {
+            // Check if they share files — only depend if there's actual overlap
+            const prFileSet = new Set(fileMap.prFiles.get(pr.number) ?? []);
+            const otherFiles = fileMap.prFiles.get(other.number) ?? [];
+            const hasOverlap = otherFiles.some((f) => prFileSet.has(f));
+            if (hasOverlap) {
+              const deps = dependsOn.get(pr.number) ?? [];
+              if (!deps.includes(other.number)) deps.push(other.number);
+              dependsOn.set(pr.number, deps);
+
+              const blk = blocks.get(other.number) ?? [];
+              if (!blk.includes(pr.number)) blk.push(pr.number);
+              blocks.set(other.number, blk);
+            }
+          }
+        }
       }
     }
   }
@@ -343,6 +471,7 @@ export async function runPRReviewStage(
   pr: OpenPR,
   workspaceRoot: string,
   projectsDir = '.',
+  fileOwnership?: FileOwnershipMap,
 ): Promise<AgentResult> {
   const projectPath = resolve(workspaceRoot, projectsDir, pr.project);
   const forgeRoot = resolve(workspaceRoot, '.forge');
@@ -402,16 +531,46 @@ own PR. Focus ONLY on the unique delta introduced by this PR.
 - **Unique head commit:** \`${pr.uniqueHeadSha}\`
 
 To see ONLY the unique changes for this PR (not ancestor commits), run:
-\`gh pr diff ${pr.number} --repo ${pr.repo}\`
+\`git diff origin/${pr.dependsOnPRs.length > 0 ? `<parent-branch>` : 'main'}...origin/${pr.branch}\`
 
-GitHub's diff view already does this automatically — it shows only the delta
-above the merge-base. Trust the diff output, not the raw git log.
+NOTE: \`gh pr diff\` shows accumulated diff against main for stacked PRs.
+To see only this PR's unique changes, diff against the parent branch, not main.
 
 **Merge recommendation:** ${pr.dependsOnPRs.length > 0
     ? `Wait for PR(s) ${pr.dependsOnPRs.map((n) => `#${n}`).join(', ')} to merge first.`
     : 'This is a foundation PR — safe to merge immediately once approved.'
   }
 ` : '';
+
+  // Build cross-PR file overlap context when available
+  let fileOverlapBlock = '';
+  if (fileOwnership && fileOwnership.overlappingFiles.size > 0) {
+    const prFileSet = new Set(fileOwnership.prFiles.get(pr.number) ?? []);
+    const relevantOverlaps: string[] = [];
+
+    for (const [file, owners] of fileOwnership.overlappingFiles) {
+      if (prFileSet.has(file)) {
+        const otherPRs = owners.filter((n) => n !== pr.number);
+        if (otherPRs.length > 0) {
+          relevantOverlaps.push(`- \`${file}\` → also in PR ${otherPRs.map((n) => `#${n}`).join(', ')}`);
+        }
+      }
+    }
+
+    if (relevantOverlaps.length > 0) {
+      fileOverlapBlock = `
+## Cross-PR File Awareness (IMPORTANT)
+
+These files in this PR are also modified by other PRs in this review batch.
+They represent shared work across the implementation cycle — do NOT flag them
+as "unrelated to this PR" or "belongs in a separate PR." Instead, review
+whether THIS PR's changes to these files are correct and consistent.
+
+${relevantOverlaps.join('\n')}
+
+`;
+    }
+  }
 
   const prompt = `You are reviewing PR #${pr.number} in ${pr.repo}.
 
@@ -421,8 +580,7 @@ above the merge-base. Trust the diff output, not the raw git log.
 - Branch: ${pr.branch}
 - Repo: ${pr.repo}
 - Project: ${pr.project}
-${mergeContextBlock}
-## Your Task
+${mergeContextBlock}${fileOverlapBlock}## Your Task
 
 Review this PR using the pr-reviewer process. Specifically:
 

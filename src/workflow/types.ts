@@ -120,6 +120,36 @@ export interface RoadmapMilestone {
   readonly dependsOn: readonly string[];
 }
 
+// === Close-Out Metadata ===
+
+/**
+ * Metadata for close-out work items created during the review phase.
+ *
+ * Close-out items skip test/plan stages — they enter at `develop` stage
+ * with the existing PR branch. The worker handles them differently based
+ * on the `action` field.
+ */
+export interface CloseOutMeta {
+  /** PR number being closed out. */
+  readonly prNumber: number;
+  /** Repository in owner/repo format. */
+  readonly repo: string;
+  /** What to do: merge directly or fix first. */
+  readonly action: 'fix-and-merge' | 'merge-only';
+  /** User feedback from the interactive review session. */
+  readonly userFeedback?: string;
+  /** Number of issues found in the initial automated review. */
+  readonly initialIssueCount: number;
+  /** Merge layer — 0=foundation, higher=must wait for lower layers. Guides merge train ordering. */
+  readonly mergeLayer: number;
+  /** PR numbers this depends on — must merge before this one. */
+  readonly dependsOnPRs: readonly number[];
+  /** PR numbers this blocks — merge after this one. */
+  readonly blocksPRs: readonly number[];
+  /** Branch name for this PR. */
+  readonly branch: string;
+}
+
 // === Work Items ===
 
 export interface WorkItem {
@@ -167,6 +197,9 @@ export interface WorkItem {
 
   /** Reason for blocking/escalation */
   blockReason?: string;
+
+  /** Close-out metadata — present when this item was created by the review phase. */
+  readonly closeOut?: CloseOutMeta;
 }
 
 export interface StageOutput {
