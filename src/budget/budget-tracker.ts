@@ -181,7 +181,13 @@ export class BudgetTracker {
   private loadState(): BudgetState {
     if (existsSync(this.statePath)) {
       try {
-        return JSON.parse(readFileSync(this.statePath, 'utf-8')) as BudgetState;
+        const raw = JSON.parse(readFileSync(this.statePath, 'utf-8')) as Partial<BudgetState>;
+        // Defensive defaults — archiveCycle may write a partial budget.json
+        return {
+          currentRunCostUsd: raw.currentRunCostUsd ?? 0,
+          dailyCosts: raw.dailyCosts ?? {},
+          lastUpdated: raw.lastUpdated ?? new Date().toISOString(),
+        };
       } catch {
         // Corrupted — start fresh
       }

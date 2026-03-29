@@ -29,11 +29,11 @@ import { loadSettings, resolveProjectPath, type ForgeSettings } from '../config/
 import { StateStore } from '../state/index.js';
 import { EventLog } from '../events/index.js';
 import { BudgetTracker } from '../budget/index.js';
-import { ResourceMonitor, DEFAULT_THRESHOLDS } from '../monitor/index.js';
+import { ResourceMonitor, DEFAULT_THRESHOLDS, DEFAULT_RESOURCE_SLOTS } from '../monitor/index.js';
 import { AdaptiveConcurrency } from '../monitor/adaptive-concurrency.js';
 import { ResourceProfiler, type ResourceObservation } from '../monitor/resource-profiler.js';
 import { JobQueue } from './queue.js';
-import type { Job } from './types.js';
+import { JOB_PRIORITY, type Job } from './types.js';
 import { runRoadmapStage } from '../workflow/stages/roadmap.js';
 import { runPlanStage } from '../workflow/stages/plan.js';
 import { runTestStage } from '../workflow/stages/test.js';
@@ -42,11 +42,32 @@ import { runPRStage } from '../workflow/stages/pr.js';
 import { markForReview } from '../workflow/stages/review.js';
 import { runReflectionStage } from '../workflow/stages/reflect.js';
 import { scanOpenPRs, runPRReviewStage } from '../workflow/stages/review-prs.js';
-import { STAGE_AGENT_MAP, type WorkItem } from '../workflow/types.js';
+import { saveReviewFindings, parseReviewOutput, parseReviewFromGitHub } from '../workflow/stages/review-findings.js';
+import { loadFileOwnership } from '../workflow/stages/review-artifacts.js';
+import { runPostMergeHealthCheck, haltMergeTrain } from '../workflow/stages/health-check.js';
+import { STAGE_AGENT_MAP, type WorkItem, type WorkflowStage } from '../workflow/types.js';
 import { writeWorkerStatus, clearWorkerStatus, type WorkerStatus } from '../ui/worker-status-file.js';
+import {
+  ProcessIsolation,
+  DEFAULT_RESOURCE_PROFILES,
+} from '../monitor/process-isolation.js';
+// GitWorkflow will be integrated into workflow stages in a follow-up
 
 const POLL_INTERVAL_MS = 3_000;  // Check for new jobs every 3s
 const IDLE_LOG_INTERVAL_MS = 60_000;  // Log "still waiting" every 60s when idle
+
+// ── Graceful degradation thresholds ──────────────────────────────────
+// When memory pressure exceeds these, the worker sheds the lowest-priority
+// running job to protect higher-context processes (orchestrator, planners).
+//
+// WHY these values: agents (TypeScript compilation, test runs) can spike
+// 1-2GB in seconds. PSI avg10 is a 10s rolling average that lags behind
+// actual pressure. The memory floor triggers on MemAvailable which
+// updates every /proc read. Together they catch both gradual pressure
+// (PSI) and sudden spikes (memory floor).
+const SHED_PSI_FULL_THRESHOLD = 12;     // PSI full avg10 > 12% = critical stall (was 15 — too slow to react)
+const SHED_MEMORY_FLOOR_MB = 512;       // Below 512MB free = emergency (was 256 — too close to OOM)
+const SHED_COOLDOWN_MS = 5_000;         // Wait 5s between successive sheds (was 10s — too slow for cascading pressure)
 
 /**
  * Thrown by job executors when a job should be put back in the queue
@@ -84,6 +105,7 @@ export class Worker {
   private readonly profiler: ResourceProfiler;
   private readonly agents: Map<AgentRole, AgentDefinition>;
   private readonly queue: JobQueue;
+  private readonly isolation: ProcessIsolation;
 
   private _shutdownRequested = false;
   private _paused = false;
@@ -100,6 +122,17 @@ export class Worker {
   private readonly _inflightJobs = new Set<Promise<void>>();
   /** Projects with an active pr-fix job — serialize fixes per project to avoid conflict whack-a-mole. */
   private readonly _projectFixLocks = new Set<string>();
+  /** Active job IDs → priority for priority-based shedding. */
+  private readonly _activeJobPriorities = new Map<string, number>();
+  /**
+   * Deferred job cooldown — tracks jobs that were recently deferred (dependency-blocked).
+   * Key = job ID, value = timestamp when cooldown expires.
+   * Prevents the claim loop from re-claiming a deferred job immediately after unclaim,
+   * which was causing a tight loop of claim→defer→unclaim at ~3-5/second.
+   */
+  private readonly _deferredCooldowns = new Map<string, number>();
+  /** Timestamp of last shed event — cooldown prevents rapid-fire kills. */
+  private _lastShedAt = 0;
 
   // ── Session integration callbacks ──────────────────────────────
 
@@ -136,6 +169,16 @@ export class Worker {
     });
     this.agents = loadAgents(this.settings);
     this.queue = new JobQueue(forgeRoot);
+    this.isolation = new ProcessIsolation();
+
+    if (this.isolation.isAvailable) {
+      console.log(chalk.dim('  🔒 Process isolation: cgroup v2 available'));
+    } else {
+      const reason = this.isolation.unavailableReason;
+      console.log(chalk.dim(`  ⚠ Process isolation: cgroups unavailable (${reason})`));
+      console.log(chalk.dim('    Launch via `forge` (tmux UI) for cgroup support, or run:'));
+      console.log(chalk.dim('    systemd-run --user --scope -p Delegate=yes -- forge worker'));
+    }
 
     // Migrate legacy work items
     const migrated = this.store.migrateLegacyWorkItems();
@@ -203,6 +246,46 @@ export class Worker {
     return this.budget;
   }
 
+  /**
+   * Returns a Promise that resolves when no review jobs for the given
+   * project are queued or running. Used by the interactive review session
+   * to block until all automated pre-reviews finish.
+   */
+  waitForReviewsDrained(project: string): Promise<void> {
+    return new Promise((resolve) => {
+      const check = (): void => {
+        const pending = this.queue.all().filter(
+          (j) => j.type === 'review' && j.project === project
+            && (j.status === 'queued' || j.status === 'running'),
+        );
+        if (pending.length === 0) { resolve(); return; }
+        setTimeout(check, 2_000);
+      };
+      check();
+    });
+  }
+
+  /**
+   * Returns a Promise that resolves when all close-out work items for the given
+   * PR numbers are completed or failed. Used by the interactive review session
+   * to block between merge layers in a progressive review.
+   */
+  waitForCloseOutsDrained(project: string, prNumbers: readonly number[]): Promise<void> {
+    return new Promise((resolve) => {
+      const prSet = new Set(prNumbers);
+      const check = (): void => {
+        const items = this.store.getWorkItemsByProject(project)
+          .filter((wi) => wi.closeOut && prSet.has(wi.closeOut.prNumber));
+        const allDone = items.length > 0 && items.every(
+          (wi) => wi.status === 'completed' || wi.status === 'failed',
+        );
+        if (allDone) { resolve(); return; }
+        setTimeout(check, 3_000);
+      };
+      check();
+    });
+  }
+
   /** Write current status to .forge/worker-status.json for UI panes. */
   private broadcastStatus(): void {
     const health = this.resources.check();
@@ -264,6 +347,23 @@ export class Worker {
     const recovered = this.queue.recoverStuck();
     if (recovered > 0) {
       console.log(chalk.yellow(`  Recovered ${recovered} stuck job(s) from previous run.`));
+
+      // Diagnose the crash to build actionable learnings
+      try {
+        const { analyzeCrash } = await import('../diagnostics/crash-analyzer.js');
+        const diagnosis = analyzeCrash(resolve(this.settings.workspaceRoot, '.forge'));
+        console.log(chalk.yellow(`  Crash diagnosis: ${diagnosis.summary}`));
+        for (const rec of diagnosis.recommendations) {
+          console.log(chalk.dim(`    → ${rec}`));
+        }
+        this.eventLog.emit({
+          type: 'job.failed',
+          project: diagnosis.project,
+          summary: `Crash recovery: ${diagnosis.summary}`,
+        });
+      } catch {
+        // Crash analysis is best-effort — don't block startup
+      }
     }
 
     // Detect agents orphaned by a previous crash (OOM, SIGKILL, etc.)
@@ -332,12 +432,24 @@ export class Worker {
         continue; // Re-check health before claiming
       }
 
+      // ── Graceful degradation: shed load before OOM kills everything ──
+      // Check BEFORE claiming new work — if memory is critical, kill a
+      // low-priority running job to free headroom. This is the core
+      // mechanism that prevents WSL crashes during overnight runs.
+      this.checkMemoryPressure();
+
       // Adaptive concurrency — evaluate how many agents the system can handle
       // based on CPU load, memory, and learned resource profiles.
+      //
+      // Compute effective slot ceiling: when all pending jobs require the same
+      // resource slot (e.g. build), cap the scaler's target at that slot's
+      // capacity. Without this, the scaler "banks" a high target (ceiling=6)
+      // but only 2 build jobs can run, causing burst behavior when slots free.
       const pendingJobs = this.queue.queued().slice(0, 5).map(j => ({
         type: j.type, project: j.project ?? undefined,
       }));
-      const concurrency = this.adaptive.evaluate(this._activeJobs, pendingJobs);
+      const effectiveSlotCeiling = this.computeEffectiveSlotCeiling(pendingJobs);
+      const concurrency = this.adaptive.evaluate(this._activeJobs, pendingJobs, effectiveSlotCeiling);
 
       // If throttled (critical pressure), wait for the system to recover
       if (concurrency.throttled && this._activeJobs > 0) {
@@ -360,6 +472,14 @@ export class Worker {
         let allBlocked = true;
 
         for (const candidate of queued) {
+          // Deferred cooldown: skip jobs that were recently deferred (dependency-blocked).
+          // Without this, a deferred job bounces claim→defer→unclaim in a tight loop.
+          const cooldownExpiry = this._deferredCooldowns.get(candidate.id);
+          if (cooldownExpiry && Date.now() < cooldownExpiry) {
+            continue;
+          }
+          this._deferredCooldowns.delete(candidate.id);
+
           // Per-project serialization for pr-fix jobs: only one fix at a time
           // per project to prevent parallel fixes from creating new conflicts.
           if (candidate.type === 'pr-fix' && candidate.project && this._projectFixLocks.has(candidate.project)) {
@@ -375,6 +495,25 @@ export class Worker {
             }
             this.resources.recordBlock(blocked);
             continue; // Skip — try next job in queue
+          }
+
+          // Pre-check work-item dependencies before claiming.
+          // Without this, a dependency-blocked job at the head of the queue
+          // gets claimed → deferred → unclaimed in a tight loop, starving
+          // jobs behind it that have no dependencies.
+          if (candidate.type === 'work-item' && candidate.metadata.workItemId) {
+            const wi = this.store.getWorkItem(candidate.metadata.workItemId as string);
+            if (wi) {
+              const deps = wi.dependsOn ?? [];
+              if (deps.length > 0) {
+                const allItems = this.store.getWorkItemsByProject(wi.project);
+                const completedIds = new Set(allItems.filter((i) => i.status === 'completed').map((i) => i.id));
+                const unmet = deps.filter((dep) => !completedIds.has(dep));
+                if (unmet.length > 0) {
+                  continue; // Skip — dependencies not yet met
+                }
+              }
+            }
           }
 
           // Found an eligible job
@@ -410,6 +549,11 @@ export class Worker {
 
         // Stagger agent spawns slightly to avoid rate-limit bursts
         await this.sleep(300 + Math.random() * 700);
+
+        // Re-check memory pressure between claims — agents can spike memory
+        // during the stagger sleep. Without this, the claim loop only checks
+        // once per tick (3s) and can spawn into an already-critical system.
+        this.checkMemoryPressure();
       }
 
       // If nothing is running and nothing was claimed
@@ -559,6 +703,7 @@ export class Worker {
 
   private async executeJob(job: Job): Promise<void> {
     this._activeJobs++;
+    this._activeJobPriorities.set(job.id, job.priority ?? JOB_PRIORITY[job.type] ?? 50);
     const startTime = Date.now();
 
     // Snapshot baseline metrics before the job starts — used to calculate
@@ -566,10 +711,16 @@ export class Worker {
     const baselineHealth = this.resources.check();
     let jobSuccess = false;
 
+    // Create cgroup for process isolation (if available)
+    const resourceReq = DEFAULT_RESOURCE_PROFILES[job.type];
+    const cgroupPath = resourceReq
+      ? this.isolation.createCgroup(job.id, resourceReq)
+      : null;
+
     this.eventLog.emit({
       type: 'job.start',
       project: job.project ?? undefined,
-      summary: `Starting job: ${job.type}${job.project ? ` for ${job.project}` : ''}`,
+      summary: `Starting job: ${job.type}${job.project ? ` for ${job.project}` : ''}${cgroupPath ? ' [isolated]' : ''}`,
     });
 
     try {
@@ -613,9 +764,12 @@ export class Worker {
         },
       });
     } catch (error) {
-      // Deferred jobs go back in the queue — not completed, not failed
+      // Deferred jobs go back in the queue — not completed, not failed.
+      // Apply a 30s cooldown so the claim loop doesn't re-claim this job
+      // immediately, which was causing tight loops of ~3-5 claims/second.
       if (error instanceof JobDeferred) {
         this.queue.unclaim(job.id);
+        this._deferredCooldowns.set(job.id, Date.now() + 30_000);
         return;
       }
 
@@ -645,8 +799,22 @@ export class Worker {
       }
     } finally {
       this._activeJobs--;
+      this._activeJobPriorities.delete(job.id);
       // Release any resource slots held by this job
       this.resources.releaseAll(job.id);
+
+      // Read cgroup memory stats before destroying (for profiler)
+      const cgroupStats = this.isolation.readMemoryStats(job.id);
+      if (cgroupStats?.oomKilled) {
+        this.eventLog.emit({
+          type: 'job.failed',
+          project: job.project ?? undefined,
+          summary: `OOM killed: ${job.type}${job.project ? ` for ${job.project}` : ''} (peak: ${Math.round(cgroupStats.peakBytes / 1024 / 1024)}MB)`,
+        });
+      }
+
+      // Clean up cgroup
+      this.isolation.destroyCgroup(job.id);
 
       // Record resource observation for the profiler — builds per-project
       // resource usage knowledge over time for smarter scheduling.
@@ -657,7 +825,9 @@ export class Worker {
         project: job.project ?? undefined,
         cpuLoadFactor: Math.max(0, endHealth.cpuLoadFactor - baselineHealth.cpuLoadFactor + 0.05),
         peakMemoryPercent: endHealth.memoryUsagePercent,
-        memoryDeltaMb: Math.max(0, baselineHealth.availableMemoryMb - endHealth.availableMemoryMb),
+        memoryDeltaMb: cgroupStats
+          ? Math.round(cgroupStats.peakBytes / 1024 / 1024)
+          : Math.max(0, baselineHealth.availableMemoryMb - endHealth.availableMemoryMb),
         durationMs,
         success: jobSuccess,
         recordedAt: new Date().toISOString(),
@@ -786,8 +956,13 @@ export class Worker {
       // defer it. Reviewing/fixing dependent PRs before their parents merge
       // wastes effort — they'll have conflicts that resolve automatically
       // once the parent merges.
+      //
+      // EXCEPTION: preReview mode bypasses this gate. Pre-reviews collect
+      // findings for ALL PRs so the interactive session can present them
+      // holistically. The reviewer is told to focus on the unique delta
+      // (via stacked branch context), so it's safe to review in isolation.
       const dependsOnPRs = (job.metadata.dependsOnPRs as number[] | undefined) ?? [];
-      if (dependsOnPRs.length > 0) {
+      if (dependsOnPRs.length > 0 && job.metadata.preReview !== true) {
         try {
           const stillOpen = dependsOnPRs.filter((depPr) => {
             try {
@@ -826,7 +1001,11 @@ export class Worker {
         chainMembers:  (job.metadata.chainMembers as number[] | undefined),
       };
 
-      const result = await runPRReviewStage(prReviewer, pr, this.settings.workspaceRoot, this.settings.projectsDir);
+      // Load file ownership map from review artifact (built during scan phase)
+      const forgeRootForOwnership = resolve(this.settings.workspaceRoot, '.forge');
+      const fileOwnership = loadFileOwnership(forgeRootForOwnership, project) ?? undefined;
+
+      const result = await runPRReviewStage(prReviewer, pr, this.settings.workspaceRoot, this.settings.projectsDir, fileOwnership);
       await this.recordAgentCost();
 
       this.eventLog.emit({
@@ -834,6 +1013,120 @@ export class Worker {
         project,
         summary: `PR #${prNumber} reviewed: ${result.output.slice(0, 120)}`,
       });
+
+      // ── Pre-review mode (interactive review phase 1) ────────────────
+      // When preReview=true, the interactive session queued this review for
+      // automated findings collection. Write findings to disk and stop —
+      // no fix-loop, no merge. The interactive session will present these
+      // findings to the user and create close-out items.
+      if (job.metadata.preReview === true) {
+        const forgeRoot = resolve(this.settings.workspaceRoot, '.forge');
+        const projectPath = resolveProjectPath(this.settings, project);
+
+        // Fetch findings from the GitHub comment (where the agent actually posts them).
+        // Falls back to stdout parsing if GitHub fetch fails.
+        const ghReport = parseReviewFromGitHub(prNumber, repo, project, currentRemoteSha, projectPath);
+        const report = ghReport.findings.length > 0
+          ? ghReport
+          : parseReviewOutput(result.output, prNumber, project, currentRemoteSha);
+
+        saveReviewFindings(forgeRoot, report);
+        console.log(chalk.dim(`  PR #${prNumber}: pre-review findings saved (${report.findings.length} finding(s), verdict: ${report.verdict})`));
+        return;
+      }
+
+      // ── Close-out re-review mode ────────────────────────────────────
+      // When isCloseOut=true, this is a re-review after a close-out fix.
+      // Skip the round-0 human pause — always auto-loop. On approval,
+      // auto-merge. On changes-requested, queue another fix (up to max rounds).
+      // Also detect strictness drift from DEFERRED OBSERVATIONS sections.
+      if (job.metadata.isCloseOut === true) {
+        const output = result.output;
+        const currentRound = (job.metadata.fixRound as number | undefined) ?? 0;
+        const MAX_FIX_ROUNDS = 3;
+
+        // Detect strictness drift: if the re-review has DEFERRED OBSERVATIONS,
+        // the reviewer raised new unrelated issues — emit a drift event.
+        if (/DEFERRED OBSERVATIONS/i.test(output)) {
+          this.eventLog.emit({
+            type: 'review.drift',
+            project,
+            summary: `PR #${prNumber}: strictness drift detected — reviewer raised new issues in close-out re-review (round ${currentRound})`,
+          });
+        }
+
+        if (/REVIEW POSTED:\s*approved/i.test(output)) {
+          try {
+            const isMergeable = await this.isSelfAuthoredAndMergeable(prNumber, repo);
+            if (isMergeable) {
+              execSync(
+                `gh pr merge ${prNumber} --repo ${repo} --squash --delete-branch`,
+                { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+              );
+              console.log(chalk.green(`  ✓ PR #${prNumber} (${project}) close-out merged`));
+              this.eventLog.emit({
+                type: 'pr.merged',
+                project,
+                summary: `PR #${prNumber} close-out merged (approved in re-review round ${currentRound})`,
+              });
+
+              // Mark the close-out work item completed
+              const closeOutItem = this.store.getWorkItemsByProject(project)
+                .find((wi) => wi.closeOut?.prNumber === prNumber && wi.status !== 'completed');
+              if (closeOutItem) {
+                closeOutItem.status = 'completed';
+                closeOutItem.stage = 'review';
+                this.store.saveWorkItem(closeOutItem);
+
+                // Post-merge health check before unblocking dependents
+                const projectPath = resolveProjectPath(this.settings, project);
+                const healthResult = runPostMergeHealthCheck(
+                  projectPath, project, prNumber, this.settings.workspaceRoot, this.eventLog,
+                );
+                if (healthResult.passed) {
+                  this.requeueDependentCloseOuts(closeOutItem, project);
+                } else {
+                  haltMergeTrain(this.store, project, prNumber, this.eventLog);
+                }
+              }
+            }
+          } catch (mergeErr) {
+            const mergeMsg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
+            console.log(chalk.yellow(`  PR #${prNumber} close-out approved but merge failed: ${mergeMsg.slice(0, 100)}`));
+          }
+          return;
+        }
+
+        if (/REVIEW POSTED:\s*changes-requested/i.test(output)) {
+          const nextRound = currentRound + 1;
+          if (nextRound > MAX_FIX_ROUNDS) {
+            console.log(chalk.bold.red(`\n  ALERT: Close-out PR #${prNumber} (${project}) hit ${MAX_FIX_ROUNDS} fix rounds.`));
+            this.eventLog.emit({
+              type: 'review.complete',
+              project,
+              summary: `ALERT: Close-out PR #${prNumber} exceeded ${MAX_FIX_ROUNDS} fix rounds`,
+            });
+            // Mark the close-out work item as failed so the heartbeat recovery
+            // doesn't reset it to pending and restart the fix loop from round 1.
+            const closeOutItem = this.store.getWorkItemsByProject(project)
+              .find((wi) => wi.closeOut?.prNumber === prNumber && wi.status !== 'completed');
+            if (closeOutItem) {
+              closeOutItem.status = 'failed';
+              closeOutItem.blockReason = `Exceeded ${MAX_FIX_ROUNDS} fix rounds — needs human guidance`;
+              closeOutItem.updatedAt = new Date().toISOString();
+              this.store.saveWorkItem(closeOutItem);
+            }
+          } else {
+            console.log(chalk.dim(`  Close-out PR #${prNumber}: queuing fix round ${nextRound}/${MAX_FIX_ROUNDS}`));
+            this.queue.post('pr-fix', 'pr-fix', project, {
+              ...job.metadata,
+              fixRound: nextRound,
+              lastReviewedSha: currentRemoteSha || undefined,
+            }, 12);
+          }
+        }
+        return;
+      }
 
       // Parse the agent's output to decide the next step in the bounce cycle.
       //
@@ -1092,6 +1385,51 @@ export class Worker {
     });
   }
 
+  /**
+   * Merge train: after a close-out item merges, unblock dependent close-out items.
+   *
+   * Close-out items carry `dependsOn` (work item IDs of parent close-outs).
+   * When a parent completes, dependent items become actionable. The worker's
+   * normal dependency check in job dispatch handles this, but we also nudge
+   * blocked items back to pending so they're picked up promptly.
+   */
+  private requeueDependentCloseOuts(mergedItem: import('../workflow/types.js').WorkItem, project: string): void {
+    const mergedPrNumber = mergedItem.closeOut?.prNumber;
+    if (!mergedPrNumber) return;
+
+    const allItems = this.store.getWorkItemsByProject(project);
+    const dependents = allItems.filter((wi) =>
+      wi.closeOut !== undefined &&
+      wi.dependsOn.includes(mergedItem.id) &&
+      (wi.status === 'pending' || wi.status === 'blocked'),
+    );
+
+    if (dependents.length === 0) return;
+
+    console.log(chalk.cyan(`  Merge train: PR #${mergedPrNumber} merged, unblocking ${dependents.length} dependent close-out(s)`));
+
+    for (const dep of dependents) {
+      // Check if ALL dependencies are now completed
+      const allDepsMet = dep.dependsOn.every((depId) => {
+        const depItem = allItems.find((wi) => wi.id === depId);
+        return depItem?.status === 'completed';
+      });
+
+      if (allDepsMet) {
+        dep.status = 'pending';
+        dep.blockReason = undefined;
+        this.store.saveWorkItem(dep);
+
+        const layer = dep.closeOut?.mergeLayer ?? 0;
+        this.queue.post('work-item', 'review', project, {
+          workItemId: dep.id,
+        }, 8 + layer);
+
+        console.log(chalk.dim(`    Close-out PR #${dep.closeOut?.prNumber}: unblocked, queued for processing`));
+      }
+    }
+  }
+
   private async executePrFixJob(job: Job): Promise<void> {
     const developer = this.requireAgent('developer');
     const prNumber = job.metadata.prNumber as number | undefined;
@@ -1236,6 +1574,18 @@ Your final line MUST be one of:
 - \`FIX SKIPPED: no blockers in review for PR #${prNumber}\`
 - \`FAILED: <reason>\``;
 
+    // Capture remote SHA BEFORE the agent runs so we can detect whether the
+    // fix actually pushed. Without this, the post-fix SHA is used as the
+    // review baseline — causing the re-review to always skip (compares
+    // against itself).
+    let preFixSha = '';
+    try {
+      preFixSha = execSync(
+        `gh api repos/${repo}/pulls/${prNumber} --jq .head.sha`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      ).trim();
+    } catch { /* if we can't check, proceed — pushLanded will default true */ }
+
     const result = await runAgent({
       agent: developer,
       prompt,
@@ -1261,33 +1611,50 @@ Your final line MUST be one of:
       summary: `PR #${prNumber} fix round ${fixRound}: ${result.output.slice(0, 120)}`,
     });
 
-    // After a fix, check if the remote HEAD actually changed before posting re-review.
-    // If the fixer didn't manage to push, skip re-review to prevent infinite loops.
-    const lastReviewedSha = job.metadata.lastReviewedSha as string | undefined;
-    let currentRemoteSha = '';
+    // Check agent success BEFORE posting re-review.
+    // WHY: runAgent resolves (doesn't throw) even on agent exit code 1.
+    // Without this, nested-session errors or agent crashes are silently
+    // treated as successful fixes, posting useless re-reviews.
+    if (!result.success) {
+      console.log(chalk.red(`  PR #${prNumber} fix round ${fixRound}: agent failed — ${result.output.slice(0, 120)}`));
+      throw new Error(`pr-fix agent failed: ${result.output.slice(0, 200)}`);
+    }
+
+    const fixSucceeded = !/FAILED|FIX BLOCKED|ESCALATE/i.test(result.output);
+
+    // Compare post-fix remote SHA against the PRE-FIX baseline to detect
+    // whether the agent actually pushed. Using the pre-fix SHA means the
+    // re-review's lastReviewedSha will be the old SHA, so when the review
+    // fetches the current (post-push) SHA, they'll differ → review proceeds.
+    let postFixSha = '';
     try {
-      currentRemoteSha = execSync(
+      postFixSha = execSync(
         `gh api repos/${repo}/pulls/${prNumber} --jq .head.sha`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       ).trim();
     } catch { /* if we can't check, assume changed */ }
 
-    const pushLanded = !currentRemoteSha || !lastReviewedSha || currentRemoteSha !== lastReviewedSha;
-    const fixSucceeded = !/FAILED|FIX BLOCKED|ESCALATE/i.test(result.output);
+    const pushLanded = !postFixSha || !preFixSha || postFixSha !== preFixSha;
 
     if (fixSucceeded && pushLanded) {
+      // Use preFixSha as the review baseline — the review will compare this
+      // against the current remote SHA (which is postFixSha after the push).
+      // Since they differ, the review will proceed instead of skipping.
       this.queue.post('review', 'review', project, {
         ...job.metadata,
         fixRound,
-        lastReviewedSha: currentRemoteSha || lastReviewedSha,
+        lastReviewedSha: preFixSha || undefined,
       }, 9);
     } else if (!pushLanded) {
-      console.log(chalk.yellow(`  PR #${prNumber} fix round ${fixRound}: remote SHA unchanged — skipping re-review`));
+      console.log(chalk.yellow(`  PR #${prNumber} fix round ${fixRound}: remote SHA unchanged (${postFixSha.slice(0, 7)}) — skipping re-review`));
       this.eventLog.emit({
         type: 'pr-fix.complete',
         project,
         summary: `PR #${prNumber} fix round ${fixRound}: push did not land, no re-review posted`,
       });
+    } else {
+      // Fix output matched FAILED/FIX BLOCKED/ESCALATE — don't post re-review
+      console.log(chalk.yellow(`  PR #${prNumber} fix round ${fixRound}: fix did not succeed — ${result.output.slice(0, 80)}`));
     }
   }
 
@@ -1300,6 +1667,7 @@ Your final line MUST be one of:
 
     // Skip items that are already done or blocked
     if (workItem.status === 'completed' || workItem.status === 'blocked') {
+      console.log(chalk.dim(`    Skipping ${workItemId}: already ${workItem.status}`));
       return;
     }
 
@@ -1342,9 +1710,30 @@ Your final line MUST be one of:
 
   private async runWorkItemPipeline(workItem: WorkItem, projectPath: string): Promise<void> {
 
+    // ── Close-out pipeline ──────────────────────────────────────────
+    // Close-out items are created by the interactive review phase. They
+    // skip test/plan stages and either merge directly or fix then merge.
+    if (workItem.closeOut) {
+      await this.runCloseOutPipeline(workItem, projectPath);
+      return;
+    }
+
+    // ── Stage auto-advancement ──────────────────────────────────────
+    // WHY: After crashes or retries, an item's stage can fall behind its
+    // actual progress (e.g. stage='plan' but stageOutputs.plan exists).
+    // Advance past any stage that already has recorded output, so we
+    // resume from the first genuinely incomplete stage.
+    const advancedStage = this.resolveCurrentStage(workItem);
+    if (advancedStage !== workItem.stage) {
+      console.log(chalk.dim(`    Stage auto-advanced: ${workItem.stage} → ${advancedStage} (outputs exist for skipped stages)`));
+      workItem.stage = advancedStage;
+      workItem.updatedAt = new Date().toISOString();
+      this.store.saveWorkItem(workItem);
+    }
+
     try {
-      // Test stage
-      if (workItem.stage === 'test' && workItem.status === 'pending') {
+      // Test stage — accept 'in-progress' too so items stuck by a crash are retried
+      if (workItem.stage === 'test' && (workItem.status === 'pending' || workItem.status === 'in-progress')) {
         const testAgent = this.requireAgent(STAGE_AGENT_MAP.test);
         workItem.status = 'in-progress';
         this.store.saveWorkItem(workItem);
@@ -1355,8 +1744,8 @@ Your final line MUST be one of:
         if ((workItem.status as string) === 'failed') return;
       }
 
-      // Develop stage
-      if (workItem.stage === 'develop' && workItem.status === 'pending') {
+      // Develop stage — accept 'in-progress' too for crash recovery
+      if (workItem.stage === 'develop' && (workItem.status === 'pending' || workItem.status === 'in-progress')) {
         const devAgent = this.requireAgent(STAGE_AGENT_MAP.develop);
         workItem.status = 'in-progress';
         this.store.saveWorkItem(workItem);
@@ -1368,8 +1757,8 @@ Your final line MUST be one of:
         if (currentStatus === 'blocked' || currentStatus === 'failed') return;
       }
 
-      // PR stage
-      if (workItem.stage === 'pr' && workItem.status === 'pending') {
+      // PR stage — accept 'in-progress' too for crash recovery
+      if (workItem.stage === 'pr' && (workItem.status === 'pending' || workItem.status === 'in-progress')) {
         const prAgent = this.requireAgent(STAGE_AGENT_MAP.pr);
         workItem.status = 'in-progress';
         this.store.saveWorkItem(workItem);
@@ -1388,6 +1777,237 @@ Your final line MUST be one of:
       workItem.blockReason = msg;
       this.store.saveWorkItem(workItem);
       throw error;
+    }
+  }
+
+  /**
+   * Close-out pipeline — handles work items created by the review phase.
+   *
+   * merge-only: Check CI, merge PR, mark completed.
+   * fix-and-merge: Queue pr-fix → developer fixes → queue review with
+   *   isCloseOut=true → scoped re-review → merge on approval.
+   */
+  private async runCloseOutPipeline(workItem: WorkItem, _projectPath: string): Promise<void> {
+    const closeOut = workItem.closeOut!;
+    const { prNumber, repo, action } = closeOut;
+    const project = workItem.project;
+
+    if (action === 'merge-only') {
+      // Direct merge — no code changes needed
+      try {
+        execSync(
+          `gh pr merge ${prNumber} --repo ${repo} --squash --delete-branch`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        console.log(chalk.green(`  ✓ PR #${prNumber} (${project}) close-out merged (no changes needed)`));
+        workItem.status = 'completed';
+        workItem.stage = 'review';
+        this.store.saveWorkItem(workItem);
+
+        this.eventLog.emit({
+          type: 'pr.merged',
+          project,
+          summary: `PR #${prNumber} close-out merge-only completed`,
+        });
+
+        // Post-merge health check: verify main is still green before unblocking dependents
+        const projectPath = resolveProjectPath(this.settings, project);
+        const healthResult = runPostMergeHealthCheck(
+          projectPath, project, prNumber, this.settings.workspaceRoot, this.eventLog,
+        );
+        if (!healthResult.passed) {
+          haltMergeTrain(this.store, project, prNumber, this.eventLog);
+          return;
+        }
+
+        // Merge train: re-queue dependent close-out items now that this layer merged
+        this.requeueDependentCloseOuts(workItem, project);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        // Escalate to fix-and-merge: merge conflict means the developer agent
+        // needs to resolve conflicts before merging. Don't just fail — the
+        // user's review approved the content, so the fix scope is conflict
+        // resolution only.
+        if (/conflict|cannot cleanly/i.test(msg)) {
+          console.log(chalk.yellow(`  PR #${prNumber}: merge conflict — escalating to fix-and-merge`));
+          this.queue.post('pr-fix', 'pr-fix', project, {
+            prNumber,
+            repo,
+            project,
+            branch: closeOut.branch,
+            prTitle: workItem.title,
+            fixRound: 1,
+            userFeedback: 'Resolve merge conflicts with main branch, then merge.',
+            isCloseOut: true,
+          }, 12);
+          workItem.status = 'in-progress';
+          workItem.blockReason = undefined;
+          this.store.saveWorkItem(workItem);
+        } else {
+          workItem.status = 'failed';
+          workItem.blockReason = `Merge failed: ${msg.slice(0, 200)}`;
+          this.store.saveWorkItem(workItem);
+        }
+      }
+      return;
+    }
+
+    // fix-and-merge: queue a pr-fix job, then a review job with isCloseOut
+    console.log(chalk.dim(`  PR #${prNumber}: close-out fix-and-merge — queuing fix + scoped re-review`));
+
+    this.queue.post('pr-fix', 'pr-fix', project, {
+      prNumber,
+      repo,
+      project,
+      branch: workItem.branch,
+      prTitle: workItem.title,
+      fixRound: 1,
+      userFeedback: closeOut.userFeedback,
+      isCloseOut: true,
+    }, 12);
+
+    // Mark in-progress — the fix/review bounce will complete it
+    workItem.status = 'in-progress';
+    this.store.saveWorkItem(workItem);
+  }
+
+  /**
+   * Determine the correct current stage for a work item by checking which
+   * stages already have recorded output in stageOutputs.
+   *
+   * WHY: After a crash, the heartbeat retry logic resets status to 'pending'
+   * but doesn't touch stage. If the stage somehow regressed (e.g. to 'plan'
+   * when plan output already exists), the pipeline would silently skip the
+   * item since there's no handler for already-completed stages. This method
+   * walks STAGE_ORDER and returns the first stage without recorded output.
+   */
+  private resolveCurrentStage(workItem: WorkItem): WorkflowStage {
+    // Stages that the worker pipeline actually executes per work item.
+    // 'design' and 'plan' are project-level operations, not per-item —
+    // individual items enter the pipeline at 'test' at earliest.
+    const pipelineStages: readonly WorkflowStage[] = ['test', 'develop', 'pr', 'review'];
+
+    for (const stage of pipelineStages) {
+      if (!workItem.stageOutputs[stage]) {
+        return stage;
+      }
+    }
+
+    // All stages have output — item should be at review or completed
+    return 'review';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Internal: Graceful Degradation
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Check memory pressure and shed the lowest-priority running job if critical.
+   *
+   * WHY: When WSL2 runs out of memory, the kernel OOM-kills everything
+   * including the orchestrator. By proactively killing a low-priority agent
+   * job, we free memory and keep the orchestrator alive. The killed job
+   * gets re-queued and retried once pressure subsides.
+   *
+   * Uses two signals:
+   * - PSI full avg10 > threshold = tasks are fully stalled on memory
+   * - Available memory < floor = absolute emergency regardless of PSI
+   *
+   * Respects a cooldown to avoid rapid-fire kills when multiple jobs
+   * are running — give the system time to reclaim after each shed.
+   */
+  private computeEffectiveSlotCeiling(
+    pendingJobs: ReadonlyArray<{ type: string; project?: string }>,
+  ): number | undefined {
+    if (pendingJobs.length === 0) return undefined;
+
+    // Collect slot capacity constraints from pending job types.
+    // For each slot required by any pending job, the capacity of that slot
+    // limits how many of those jobs can run simultaneously.
+    let minSlotCapacity = Infinity;
+    let anySlotRequired = false;
+
+    for (const { type } of pendingJobs) {
+      const requiredSlots = JOB_RESOURCE_SLOTS[type] ?? [];
+      for (const slot of requiredSlots) {
+        anySlotRequired = true;
+        const config = this.settings.resourceSlots[slot] ?? DEFAULT_RESOURCE_SLOTS[slot];
+        if (config) {
+          minSlotCapacity = Math.min(minSlotCapacity, config.capacity);
+        }
+      }
+    }
+
+    // If no pending jobs need slots, don't constrain the scaler
+    if (!anySlotRequired) return undefined;
+
+    // The effective ceiling is the tightest slot capacity — this prevents
+    // the scaler from targeting 6 when only 2 build slots exist.
+    return minSlotCapacity === Infinity ? undefined : minSlotCapacity;
+  }
+
+  private checkMemoryPressure(): void {
+    if (this._activeJobs === 0) return;
+
+    // Cooldown: don't shed again too quickly after a recent shed
+    const now = Date.now();
+    if (now - this._lastShedAt < SHED_COOLDOWN_MS) return;
+
+    const health = this.resources.check();
+    const psi = ProcessIsolation.readPSI();
+
+    const psiCritical = psi !== null && psi.fullAvg10 > SHED_PSI_FULL_THRESHOLD;
+    const memCritical = health.availableMemoryMb < SHED_MEMORY_FLOOR_MB;
+
+    if (!psiCritical && !memCritical) return;
+
+    const reason = psiCritical
+      ? `PSI full=${psi!.fullAvg10.toFixed(1)}% (>${SHED_PSI_FULL_THRESHOLD}%)`
+      : `Available memory=${health.availableMemoryMb}MB (<${SHED_MEMORY_FLOOR_MB}MB)`;
+
+    console.log(chalk.red(`\n  ⚠ MEMORY PRESSURE CRITICAL: ${reason}`));
+    console.log(chalk.red(`    Shedding lowest-priority job to protect orchestrator...`));
+
+    // Try priority-based shedding first (requires cgroups)
+    let shedJobId = this.isolation.shedByPriority(this._activeJobPriorities);
+
+    // Fallback: if cgroups unavailable, try shedding largest
+    if (!shedJobId) {
+      shedJobId = this.isolation.shedLargest();
+    }
+
+    if (shedJobId) {
+      this._lastShedAt = now;
+      const priority = this._activeJobPriorities.get(shedJobId) ?? '?';
+
+      console.log(chalk.red(`    Killed job ${shedJobId} (priority=${priority})`));
+
+      // Re-queue the killed job so it retries after pressure subsides
+      this.queue.unclaim(shedJobId);
+
+      this.eventLog.emit({
+        type: 'job.shed',
+        summary: `Emergency shed: killed ${shedJobId} (priority=${priority}) — ${reason}`,
+        data: {
+          shedJobId,
+          reason,
+          availableMemoryMb: health.availableMemoryMb,
+          psiFullAvg10: psi?.fullAvg10,
+        },
+      });
+    } else {
+      // No cgroups — last resort: log the warning so operator can intervene
+      console.log(chalk.red(`    No cgroups available — cannot shed. Consider reducing concurrency or restarting.`));
+      this.eventLog.emit({
+        type: 'job.shed',
+        summary: `Memory pressure critical but cannot shed (no cgroups): ${reason}`,
+        data: {
+          reason,
+          availableMemoryMb: health.availableMemoryMb,
+          psiFullAvg10: psi?.fullAvg10,
+        },
+      });
     }
   }
 
@@ -1474,21 +2094,24 @@ Your final line MUST be one of:
     const { scanOpenPRs } = await import('../workflow/stages/review-prs.js');
 
     // 1. Sync merged PRs → complete work items
+    //
+    // Two paths: (a) regular work items at review stage with PR URL in stageOutputs,
+    // (b) close-out items with prNumber stored in closeOut metadata.
     let mergedCount = 0;
     for (const project of this.settings.projects) {
       const items = this.store.getWorkItemsByProject(project);
+      const projectPath = resolveProjectPath(this.settings, project);
+
+      // (a) Regular review-stage items
       const reviewItems = items.filter(
         (i) => i.stage === 'review' && i.status !== 'completed',
       );
-
       for (const item of reviewItems) {
-        // If a work item is in review stage but its PR was merged, mark it done.
         const prOutput = item.stageOutputs.pr;
         const prUrl = prOutput?.summary?.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
         if (!prUrl) continue;
 
         const prNumber = parseInt(prUrl[1], 10);
-        const projectPath = resolveProjectPath(this.settings, project);
         try {
           const state = execSync(
             `gh pr view ${prNumber} --json state --jq .state`,
@@ -1501,6 +2124,34 @@ Your final line MUST be one of:
             item.updatedAt = new Date().toISOString();
             this.store.saveWorkItem(item);
             mergedCount++;
+          }
+        } catch { /* can't check — skip */ }
+      }
+
+      // (b) Close-out items — PR number is in closeOut.prNumber, not stageOutputs
+      const closeOutItems = items.filter(
+        (i) => i.closeOut && i.status !== 'completed' && i.status !== 'failed',
+      );
+      for (const item of closeOutItems) {
+        const prNumber = item.closeOut!.prNumber;
+        try {
+          const state = execSync(
+            `gh pr view ${prNumber} --json state --jq .state`,
+            { cwd: projectPath, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          ).trim();
+
+          if (state === 'MERGED') {
+            item.status = 'completed';
+            item.updatedAt = new Date().toISOString();
+            this.store.saveWorkItem(item);
+            mergedCount++;
+            // Nudge dependents so they can proceed
+            this.requeueDependentCloseOuts(item, project);
+          } else if (state === 'CLOSED') {
+            item.status = 'failed';
+            item.blockReason = 'PR was closed without merging';
+            item.updatedAt = new Date().toISOString();
+            this.store.saveWorkItem(item);
           }
         } catch { /* can't check — skip */ }
       }
@@ -1523,9 +2174,13 @@ Your final line MUST be one of:
     const mergeOrder = [...openPRs].sort((a, b) => (a.mergeLayer ?? 0) - (b.mergeLayer ?? 0));
     let autoMerged = 0;
     const mergedProjects = new Set<string>();
+    const healthFailedProjects = new Set<string>(); // Projects where health check failed — skip further merges
 
     for (const pr of mergeOrder) {
       try {
+        // Skip projects where a health check already failed in this heartbeat
+        if (healthFailedProjects.has(pr.project)) continue;
+
         const isMergeable = await this.isSelfAuthoredAndMergeable(pr.number, pr.repo);
         if (!isMergeable) continue;
 
@@ -1541,6 +2196,22 @@ Your final line MUST be one of:
           { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
         );
         console.log(chalk.green(`  ✓ Heartbeat: auto-merged PR #${pr.number} (${pr.project})`));
+
+        // Post-merge health check — verify main is still green
+        const projectPath = resolveProjectPath(this.settings, pr.project);
+        const healthResult = runPostMergeHealthCheck(
+          projectPath, pr.project, pr.number, this.settings.workspaceRoot, this.eventLog,
+        );
+        if (!healthResult.passed) {
+          // Health check failed — halt merge train for this project, skip remaining PRs
+          healthFailedProjects.add(pr.project);
+          haltMergeTrain(this.store, pr.project, pr.number, this.eventLog);
+          // Still count this as merged (it is) but don't merge more in this project
+          mergedProjects.add(`${pr.repo}#${pr.number}`);
+          autoMerged++;
+          continue;
+        }
+
         mergedProjects.add(`${pr.repo}#${pr.number}`);
         autoMerged++;
       } catch { /* merge failed — will retry next heartbeat */ }
@@ -1570,11 +2241,18 @@ Your final line MUST be one of:
 
         // Don't double-queue if a fix or review job already exists for this PR
         const existing = this.queue.all().find(
-          (j) => (j.type === 'pr-fix' || j.type === 'review')
-            && j.metadata.prNumber === pr.number
+          (j) => (j.type === 'pr-fix' || j.type === 'review' || j.type === 'work-item')
+            && (j.metadata.prNumber === pr.number || (typeof j.metadata.workItemId === 'string' && j.metadata.workItemId.includes(`close-out-pr-${pr.number}`)))
             && (j.status === 'queued' || j.status === 'running'),
         );
         if (existing) continue;
+
+        // Skip PRs with active close-out items — those go through the close-out
+        // pipeline (dependency chain, requeueDependentCloseOuts), not standalone fixes.
+        const hasCloseOut = this.store.getWorkItemsByProject(pr.project)
+          .some((wi) => wi.closeOut?.prNumber === pr.number
+            && (wi.status === 'pending' || wi.status === 'in-progress' || wi.status === 'blocked'));
+        if (hasCloseOut) continue;
 
         this.queue.post('pr-fix', 'review', pr.project, {
           prNumber: pr.number,
@@ -1621,7 +2299,40 @@ Your final line MUST be one of:
       });
     }
 
-    // 4. Queue newly-unblocked work items
+    // 4. Recover stale in-progress close-out items
+    // If a close-out item is in-progress but no job exists for it (crash/restart),
+    // reset it to pending so step 5 can re-queue it. Without this, close-out items
+    // orphaned by crashes stay in-progress forever.
+    let recoveredCount = 0;
+    for (const project of this.settings.projects) {
+      const items = this.store.getWorkItemsByProject(project);
+      const staleCloseOuts = items.filter(
+        (i) => i.closeOut && i.status === 'in-progress',
+      );
+
+      for (const item of staleCloseOuts) {
+        const hasJob = this.queue.all().some(
+          (j) => (j.type === 'work-item' || j.type === 'pr-fix' || j.type === 'review')
+            && (j.metadata.workItemId === item.id || j.metadata.prNumber === item.closeOut?.prNumber)
+            && (j.status === 'queued' || j.status === 'running'),
+        );
+        if (!hasJob) {
+          item.status = 'pending';
+          item.updatedAt = new Date().toISOString();
+          this.store.saveWorkItem(item);
+          recoveredCount++;
+        }
+      }
+    }
+    if (recoveredCount > 0) {
+      console.log(chalk.yellow(`  ♻ Heartbeat: recovered ${recoveredCount} stale in-progress close-out item(s)`));
+      this.eventLog.emit({
+        type: 'heartbeat.retry' as import('../events/event-log.js').EventType,
+        summary: `Recovered ${recoveredCount} stale close-out item(s) from in-progress → pending`,
+      });
+    }
+
+    // 5. Queue newly-unblocked work items
     let queuedCount = 0;
     for (const project of this.settings.projects) {
       const items = this.store.getWorkItemsByProject(project);
@@ -1732,12 +2443,15 @@ Your final line MUST be one of:
         console.log(chalk.dim('    Finishing current job, then stopping...\n'));
 
         this._shutdownRequested = true;
+        // Clean up all cgroups on shutdown
+        this.isolation.destroyAll();
         this.eventLog.emit({
           type: 'worker.shutdown',
           summary: `Worker shutdown by ${signal}. Processed: ${this._processedCount}. ${this.budget.summary()}`,
         });
       } else {
         console.log(chalk.red('\n  Force exit.'));
+        this.isolation.destroyAll();
         process.exit(1);
       }
     };

@@ -27,6 +27,40 @@ export async function runReflectionStage(
   const recentEvents = eventLog.recent(200);
   const latestLearning = store.getLatestLearning();
 
+  // Compute roadmap alignment scores per project
+  const alignmentSummaries: string[] = [];
+  const projects = [...new Set(workItems.map((i) => i.project))];
+  for (const project of projects) {
+    const roadmap = store.getRoadmap(project);
+    if (!roadmap?.milestones?.length) continue;
+
+    const projectItems = workItems.filter((i) => i.project === project);
+    let deliveredWeight = 0;
+    let totalWeight = 0;
+    const milestoneLines: string[] = [];
+
+    for (const m of roadmap.milestones) {
+      const weight = m.priority === 'high' ? 3 : m.priority === 'medium' ? 2 : 1;
+      totalWeight += weight;
+
+      const keywords = m.title.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').split(/[\s-]+/).filter((w) => w.length >= 3);
+      const minOverlap = keywords.length <= 2 ? 1 : 2;
+      const related = projectItems.filter((wi) => {
+        const wiKeywords = wi.title.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').split(/[\s-]+/).filter((w) => w.length >= 3);
+        return keywords.filter((k) => wiKeywords.includes(k)).length >= minOverlap;
+      });
+      const delivered = related.length > 0 && related.every((wi) => wi.status === 'completed');
+      if (delivered) deliveredWeight += weight;
+
+      milestoneLines.push(`  - [${delivered ? '✓' : '✗'}] ${m.title} (${m.priority}, ${related.length} items)`);
+    }
+
+    const score = totalWeight > 0 ? Math.round((deliveredWeight / totalWeight) * 100) : 0;
+    alignmentSummaries.push(
+      `### ${project} — ${score}% weighted alignment\n${milestoneLines.join('\n')}`,
+    );
+  }
+
   // Summarize work item outcomes
   const completedItems = workItems.filter((i) => i.status === 'completed');
   const failedItems = workItems.filter((i) => i.status === 'failed');
@@ -85,6 +119,10 @@ ${errorEvents.length > 0
     ? `\n## Previous Reflection\n\n${latestLearning.slice(0, 3000)}`
     : '';
 
+  const alignmentSection = alignmentSummaries.length > 0
+    ? `\n## Roadmap Alignment\n\n${alignmentSummaries.join('\n\n')}`
+    : '';
+
   const prompt = `You are a reflective agent analyzing the Forge orchestrator's recent work output.
 
 Your purpose: identify patterns, inefficiencies, and opportunities for improvement.
@@ -94,6 +132,7 @@ ${workItemSummary}
 ${costSummary}
 
 ${errorSummary}
+${alignmentSection}
 ${previousContext}
 
 ## Your Task
@@ -131,6 +170,9 @@ Produce a markdown report with the following structure:
 
 ## Process Improvements
 [Specific, actionable changes]
+
+## Roadmap Alignment
+[Score per project — milestones delivered vs planned, weighted by priority]
 
 ## Recommendations
 - **Immediate:** [Changes to make now]

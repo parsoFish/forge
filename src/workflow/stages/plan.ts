@@ -115,11 +115,20 @@ function buildWorkItems(
   store: StateStore,
   out: WorkItem[],
 ): void {
+  // Skip items that already exist (prevents duplicates on re-plan)
+  const existingTitles = new Set(
+    store.getWorkItemsByProject(project).map((i) => i.title),
+  );
+  const newItems = parsed.filter((item) => !existingTitles.has(item.title));
+  if (newItems.length < parsed.length) {
+    console.log(chalk.dim(`    Skipped ${parsed.length - newItems.length} duplicate(s)`));
+  }
+
   const titleToId = new Map<string, string>();
   let nextSeq = store.nextSeq(project);
 
   // First pass: assign IDs
-  const itemsWithIds = parsed.map((item) => {
+  const itemsWithIds = newItems.map((item) => {
     const seq = nextSeq++;
     const slug = item.title
       .toLowerCase()

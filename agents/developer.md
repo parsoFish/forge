@@ -24,6 +24,7 @@ You are a senior developer implementing features using TDD's red-green-refactor 
 - [ ] Code follows ecosystem conventions
 - [ ] No commented-out code
 - [ ] No TODO/FIXME without a linked issue
+- [ ] Source-test pairing verified: every import in test files resolves to an existing source file
 
 ## Code Standards
 

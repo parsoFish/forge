@@ -33,15 +33,17 @@ ${workItem.description}
 ## Your Task
 
 1. Checkout the branch: \`git checkout ${workItem.branch}\`
-2. Push the branch: \`git push origin ${workItem.branch}\`
-3. Create a pull request using \`gh pr create\` with:
+2. **Pre-flight check:** Run the project's test command one final time to verify all tests pass.
+   If any test fails due to a missing import or unresolved source file, STOP and fix it before proceeding.
+3. Push the branch: \`git push origin ${workItem.branch}\`
+4. Create a pull request using \`gh pr create\` with:
    - A clear title following conventional commits
    - A description that explains:
      - **WHY** this change was made (not what the diff shows)
      - The design decision and alternatives considered
      - Testing approach (which layers, what's covered)
      - Any follow-up work needed
-4. Add appropriate labels if the repo supports them.
+5. Add appropriate labels if the repo supports them.
 
 ## PR Description Template
 

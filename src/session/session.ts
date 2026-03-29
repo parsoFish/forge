@@ -45,6 +45,8 @@ export class Session {
   private _resumeTimer: ReturnType<typeof setTimeout> | null = null;
   /** When the rate limit resets (ms epoch), or 0 if not limited. */
   private _rateLimitResetAt = 0;
+  /** When true, an interactive command owns the prompt — don't auto-refresh. */
+  private _interactionActive = false;
 
   constructor(workspaceRoot?: string) {
     this.orch = new Orchestrator(workspaceRoot);
@@ -109,17 +111,27 @@ export class Session {
   }
 
   /**
-   * Pause output suppression so an interactive command (like PR triage)
-   * can use the readline directly without conflicts.
+   * Pause output suppression and prompt auto-refresh so an interactive
+   * command can own the readline without the forge prompt overwriting it.
+   *
+   * @param keepSuppressed If true, don't unsuppress console output. Use
+   *   this when the interactive command spawns agents whose LiveTracker
+   *   noise should stay hidden. The command's own output goes through
+   *   writeDirect() which always works regardless of suppression.
    */
-  pauseForInteraction(): void {
-    this.output.unsuppress();
+  pauseForInteraction(keepSuppressed = false): void {
+    this._interactionActive = true;
+    if (!keepSuppressed) {
+      this.output.unsuppress();
+    }
   }
 
   /**
-   * Resume background output suppression after interactive command completes.
+   * Resume background output suppression and prompt auto-refresh after
+   * interactive command completes.
    */
   resumeAfterInteraction(): void {
+    this._interactionActive = false;
     this.output.suppress();
   }
 
@@ -135,6 +147,40 @@ export class Session {
       }
       this.rl.question(prompt, resolve);
     });
+  }
+
+  /**
+   * Write directly to stdout, bypassing the OutputInterceptor.
+   *
+   * Use this for interactive command output that should appear even while
+   * background agent noise is suppressed. Readline prompts go through
+   * process.stdout directly (not console.log), so they're unaffected.
+   */
+  writeDirect(...args: unknown[]): void {
+    this.output.writeDirect(...args);
+  }
+
+  /**
+   * Collect multi-line input from the user.
+   *
+   * Shows the prompt, then reads lines until the user enters an empty line.
+   * Returns all lines joined with newlines, trimmed. If the first line is
+   * empty, returns '' (allows skipping optional prompts with Enter).
+   *
+   * Uses writeDirect so the prompt is visible even while the OutputInterceptor
+   * is active (suppressing background agent noise).
+   */
+  async collectMultiLine(prompt: string): Promise<string> {
+    this.output.writeDirect(prompt);
+    const lines: string[] = [];
+
+    while (true) {
+      const line = await this.question('  > ');
+      if (line.trim() === '') break;
+      lines.push(line);
+    }
+
+    return lines.join('\n').trim();
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -189,6 +235,9 @@ export class Session {
   /** Refresh the prompt to reflect current state. */
   private updatePrompt(): void {
     if (!this.rl) return;
+    // Don't redraw while an interactive command owns the prompt —
+    // the forge status prompt would overwrite the command's question.
+    if (this._interactionActive) return;
     this.rl.setPrompt(this.buildPrompt());
 
     // Redraw with current input preserved

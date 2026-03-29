@@ -18,6 +18,9 @@ import {
   mkdirSync,
   readdirSync,
   unlinkSync,
+  renameSync,
+  cpSync,
+  rmSync,
 } from 'node:fs';
 import { resolve, join } from 'node:path';
 import type { WorkItem, DesignBrief, Roadmap, PhaseState, OrchestratorPhase } from '../workflow/types.js';
@@ -305,6 +308,107 @@ export class StateStore {
     }
 
     return { totalWorkItems: items.length, byStage, byStatus, byProject, pendingReview };
+  }
+
+  // --- Cycle Archival ---
+
+  /**
+   * Archive the current cycle's operational state and reset for a new cycle.
+   *
+   * Moves work items and jobs to `.forge/archive/cycle-{date}/`.
+   * Keeps learnings (they're valuable across cycles) and optionally roadmaps.
+   * Resets phase to 'roadmapping'.
+   *
+   * Returns a summary of what was archived.
+   */
+  archiveCycle(opts: { keepRoadmaps?: boolean } = {}): {
+    readonly archivedWorkItems: number;
+    readonly archivedJobs: number;
+    readonly archivePath: string;
+  } {
+    const date = new Date().toISOString().slice(0, 10);
+    const archiveDir = join(this.root, 'archive', `cycle-${date}`);
+    mkdirSync(archiveDir, { recursive: true });
+
+    let archivedWorkItems = 0;
+    let archivedJobs = 0;
+
+    // Archive work items
+    const workItemsDir = join(this.root, WORK_ITEMS_DIR);
+    if (existsSync(workItemsDir)) {
+      const targetDir = join(archiveDir, WORK_ITEMS_DIR);
+      cpSync(workItemsDir, targetDir, { recursive: true });
+      archivedWorkItems = this.listWorkItems().length;
+      rmSync(workItemsDir, { recursive: true, force: true });
+      mkdirSync(workItemsDir, { recursive: true });
+    }
+
+    // Archive jobs
+    const jobsDir = join(this.root, 'jobs');
+    if (existsSync(jobsDir)) {
+      const targetDir = join(archiveDir, 'jobs');
+      cpSync(jobsDir, targetDir, { recursive: true });
+      archivedJobs = readdirSync(jobsDir).filter((f) => f.endsWith('.json')).length;
+      rmSync(jobsDir, { recursive: true, force: true });
+      mkdirSync(jobsDir, { recursive: true });
+    }
+
+    // Archive designs (backward-compat briefs)
+    const designsDir = join(this.root, DESIGNS_DIR);
+    if (existsSync(designsDir)) {
+      cpSync(designsDir, join(archiveDir, DESIGNS_DIR), { recursive: true });
+      rmSync(designsDir, { recursive: true, force: true });
+      mkdirSync(designsDir, { recursive: true });
+    }
+
+    // Optionally archive roadmaps (default: keep them for continuity)
+    if (!opts.keepRoadmaps) {
+      const roadmapsDir = join(this.root, ROADMAPS_DIR);
+      if (existsSync(roadmapsDir)) {
+        cpSync(roadmapsDir, join(archiveDir, ROADMAPS_DIR), { recursive: true });
+        rmSync(roadmapsDir, { recursive: true, force: true });
+        mkdirSync(roadmapsDir, { recursive: true });
+      }
+    }
+
+    // Archive review findings
+    const findingsDir = join(this.root, 'review-findings');
+    if (existsSync(findingsDir)) {
+      cpSync(findingsDir, join(archiveDir, 'review-findings'), { recursive: true });
+      rmSync(findingsDir, { recursive: true, force: true });
+      mkdirSync(findingsDir, { recursive: true });
+    }
+
+    // Archive review artifacts
+    const artifactsDir = join(this.root, 'review-artifacts');
+    if (existsSync(artifactsDir)) {
+      cpSync(artifactsDir, join(archiveDir, 'review-artifacts'), { recursive: true });
+      rmSync(artifactsDir, { recursive: true, force: true });
+      mkdirSync(artifactsDir, { recursive: true });
+    }
+
+    // Archive events log
+    const eventsFile = join(this.root, 'events.jsonl');
+    if (existsSync(eventsFile)) {
+      renameSync(eventsFile, join(archiveDir, 'events.jsonl'));
+    }
+
+    // Archive budget
+    const budgetFile = join(this.root, 'budget.json');
+    if (existsSync(budgetFile)) {
+      cpSync(budgetFile, join(archiveDir, 'budget.json'));
+      // Reset budget for new cycle — must match BudgetState shape
+      writeFileSync(budgetFile, JSON.stringify({
+        currentRunCostUsd: 0,
+        dailyCosts: {},
+        lastUpdated: new Date().toISOString(),
+      }, null, 2));
+    }
+
+    // Reset phase to roadmapping
+    this.setPhase('roadmapping', `New cycle started. Previous cycle archived to ${archiveDir}`);
+
+    return { archivedWorkItems, archivedJobs, archivePath: archiveDir };
   }
 
   // --- Internal ---

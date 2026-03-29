@@ -56,7 +56,15 @@ export type EventType =
   | 'heartbeat.merge'
   | 'heartbeat.retry'
   | 'heartbeat.queue'
-  | 'agent.orphaned';
+  | 'agent.orphaned'
+  | 'cycle.archived'
+  | 'session.start'
+  | 'session.resume'
+  | 'session.complete'
+  | 'job.shed'
+  | 'review.drift'
+  | 'health.check.pass'
+  | 'health.check.fail';
 
 export interface ForgeEvent {
   readonly timestamp: string;
@@ -84,22 +92,50 @@ export class EventLog {
   /** Maps runId → descriptive filename for log lookup */
   private readonly runIdToLogFile = new Map<string, string>();
 
+  /**
+   * Buffered event writes — accumulate events and flush periodically.
+   *
+   * WHY: appendFileSync per event caused hundreds of sync writes/sec through
+   * WSL2's 9P bridge, saturating wslvmem CPU. Buffering amortizes the cost
+   * into a single write every FLUSH_INTERVAL_MS.
+   */
+  private readonly eventBuffer: string[] = [];
+  private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly FLUSH_INTERVAL_MS = 500;
+
   constructor(forgeRoot: string) {
     this.eventsPath = join(forgeRoot, 'events.jsonl');
     this.logsDir = join(forgeRoot, 'logs');
     mkdirSync(this.logsDir, { recursive: true });
+
+    // Start periodic flush
+    this.flushTimer = setInterval(() => this.flushBuffer(), EventLog.FLUSH_INTERVAL_MS);
+    // Don't keep the process alive just for event flushing
+    if (this.flushTimer.unref) this.flushTimer.unref();
   }
 
   /**
    * Emit an event to the global event log.
+   *
+   * Events are buffered and flushed every 500ms to avoid sync I/O storms.
+   * Call flushBuffer() explicitly on shutdown for data integrity.
    */
   emit(event: Omit<ForgeEvent, 'timestamp'>): ForgeEvent {
     const fullEvent: ForgeEvent = {
       ...event,
       timestamp: new Date().toISOString(),
     };
-    appendFileSync(this.eventsPath, JSON.stringify(fullEvent) + '\n');
+    this.eventBuffer.push(JSON.stringify(fullEvent));
     return fullEvent;
+  }
+
+  /**
+   * Flush buffered events to disk. Called periodically and on shutdown.
+   */
+  flushBuffer(): void {
+    if (this.eventBuffer.length === 0) return;
+    const batch = this.eventBuffer.splice(0);
+    appendFileSync(this.eventsPath, batch.join('\n') + '\n');
   }
 
   /**
@@ -167,9 +203,15 @@ export class EventLog {
   }
 
   /**
-   * Close all open log streams (for graceful shutdown).
+   * Close all open log streams and flush buffered events (for graceful shutdown).
    */
   closeAll(): void {
+    // Flush any remaining buffered events before closing
+    this.flushBuffer();
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
     for (const [id, stream] of this.activeStreams) {
       stream.end();
       this.activeStreams.delete(id);
@@ -188,7 +230,13 @@ export class EventLog {
   recent(count = 50): ForgeEvent[] {
     if (!existsSync(this.eventsPath)) return [];
     const lines = this.tailLines(this.eventsPath, count);
-    return lines.map((line) => JSON.parse(line) as ForgeEvent);
+    return lines.flatMap((line) => {
+      try {
+        return [JSON.parse(line) as ForgeEvent];
+      } catch {
+        return []; // Skip corrupted lines (e.g. partial writes during crash)
+      }
+    });
   }
 
   /**

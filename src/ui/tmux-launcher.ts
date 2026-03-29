@@ -1,7 +1,7 @@
 /**
  * tmux session launcher — creates the 4-pane Forge UI layout.
  *
- * Layout matches the design spec:
+ * Layout:
  *
  *   ┌────────────────────────┬──────────────────┐
  *   │                        │   Job Queue       │
@@ -11,14 +11,16 @@
  *   │                        │   Monitoring      │
  *   └────────────────────────┴──────────────────┘
  *
- * The left pane (60%) is the main interactive CLI (`forge session`).
- * The right column (40%) is split into 3 info panes.
+ * The left pane (65%) is the main interactive CLI (`forge session`).
+ * The right column (35%) is split bottom-up:
+ *   - Monitor: fixed ~8 rows (slots, budget, CPU/mem)
+ *   - Queue & Agents: split 50/50 of the remaining space
  *
- * `forge` (no args) calls this. There is no separate "forge ui" command —
- * the tmux layout IS the forge experience.
+ * The session command is wrapped with `systemd-run --user --scope` when
+ * available, giving the forge process a delegated cgroup scope for
+ * per-agent memory limits. Watch panes are read-only and don't need it.
  *
- * WHY tmux: it's already on WSL, gives crash isolation between panes,
- * maps directly to the 4-pane design, and needs zero npm dependencies.
+ * `forge` (no args) calls this. The tmux layout IS the forge experience.
  */
 
 import { execSync, spawn } from 'node:child_process';
@@ -44,6 +46,15 @@ function sessionExists(): boolean {
   }
 }
 
+function systemdRunAvailable(): boolean {
+  try {
+    execSync('systemd-run --user --version', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Detect how the forge CLI is invoked so tmux panes use the same path.
  * Could be `npx forge`, `node dist/cli.js`, or a globally installed `forge`.
@@ -55,6 +66,16 @@ function resolveForgeCmd(): string {
     return `node "${scriptPath}"`;
   }
   return 'npx forge';
+}
+
+/**
+ * Wrap a command with systemd-run to get a delegated cgroup scope.
+ * Only used for the session pane where agents are spawned.
+ */
+function wrapWithScope(cmd: string): string {
+  if (!systemdRunAvailable()) return cmd;
+  // --expand-environment=no suppresses the warning about env vars in args
+  return `systemd-run --user --scope --expand-environment=no -p Delegate=yes -- ${cmd}`;
 }
 
 export function launchUI(): void {
@@ -82,31 +103,27 @@ export function launchUI(): void {
   }
 
   const forgeCmd = resolveForgeCmd();
+  // Wrap session command in systemd scope for cgroup delegation
+  const sessionCmd = wrapWithScope(`${forgeCmd} session`);
 
-  // Layout designed for 80x24 minimum. Right column splits are sized
-  // so actions (the "star") gets the most space, queue and monitor
-  // are compact. All panes render bottom-up to minimize height needs.
-  //
-  //   ┌────────────────────────┬──────────────────┐
-  //   │                        │   Queue (~5 rows) │
-  //   │  Forge Orchestrator    ├──────────────────┤
-  //   │  (interactive session) │   Actions (~13)   │
-  //   │                        ├──────────────────┤
-  //   │                        │   Monitor (~6)    │
-  //   └────────────────────────┴──────────────────┘
+  // Right column layout (bottom-up):
+  //   Monitor: fixed 8 rows (small, dense info)
+  //   Queue:   50% of remaining space
+  //   Agents:  50% of remaining space
   const commands = [
     // Create session with the main orchestrator pane (interactive REPL)
-    `tmux new-session -d -s ${SESSION_NAME} '${forgeCmd} session'`,
+    `tmux new-session -d -s ${SESSION_NAME} '${sessionCmd}'`,
 
-    // Split right column (35% width — gives orchestrator more room)
+    // Split right column (35% width — gives orchestrator more room).
+    // This pane starts as queue; we split from the bottom up.
     `tmux split-window -h -t ${SESSION_NAME} -l 35% '${forgeCmd} watch:queue'`,
 
-    // Split right column: queue keeps top ~5 lines, actions+monitor get rest.
-    // 78% of right column goes to actions+monitor, 22% stays as queue.
-    `tmux split-window -v -t ${SESSION_NAME}:0.1 -l 78% '${forgeCmd} watch:actions'`,
+    // Split monitor off the bottom of the right column (small, fixed).
+    // ~8 rows is enough for worker state + jobs + CPU/mem + budget.
+    `tmux split-window -v -t ${SESSION_NAME}:0.1 -l 8 '${forgeCmd} watch:monitor'`,
 
-    // Split bottom of right column: monitor gets ~6 lines (33% of remaining)
-    `tmux split-window -v -t ${SESSION_NAME}:0.2 -l 33% '${forgeCmd} watch:monitor'`,
+    // Split remaining space evenly between queue (top) and agents (bottom).
+    `tmux split-window -v -t ${SESSION_NAME}:0.1 -l 50% '${forgeCmd} watch:actions'`,
 
     // Focus the main orchestrator pane
     `tmux select-pane -t ${SESSION_NAME}:0.0`,

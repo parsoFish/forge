@@ -29,19 +29,52 @@ const commands: SlashCommand[] = [
   {
     name: 'roadmap',
     aliases: ['rm'],
-    description: 'Queue roadmap generation for a project',
-    usage: '/roadmap [project] [-d direction]',
+    description: 'Interactive roadmap session — collaborative design conversation',
+    usage: '/roadmap <project>',
     handler: async (ctx, args) => {
-      const project = args.find(a => !a.startsWith('-'));
-      const dirIdx = args.indexOf('-d');
-      const direction = dirIdx >= 0 ? args.slice(dirIdx + 1).join(' ') : undefined;
-      await ctx.orch.roadmap(project, direction);
+      let project = args[0];
+
+      // If no project specified, let the user pick
+      if (!project) {
+        const projects = ctx.orch.getProjectNames();
+        if (projects.length === 0) {
+          ctx.session.writeDirect(chalk.red('  No projects found.'));
+          return;
+        }
+        ctx.session.writeDirect(chalk.bold('\n  Select a project for roadmapping:\n'));
+        for (let i = 0; i < projects.length; i++) {
+          ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
+        }
+        ctx.session.writeDirect('');
+
+        const choice = await ctx.session.question(chalk.blue('  Project name or number: '));
+        const choiceNum = parseInt(choice, 10);
+        if (choiceNum >= 1 && choiceNum <= projects.length) {
+          project = projects[choiceNum - 1];
+        } else if (projects.includes(choice.trim())) {
+          project = choice.trim();
+        } else {
+          ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+          return;
+        }
+      }
+
+      // Re-suppress background output. The REPL unsuppresses for all commands,
+      // but /roadmap spawns agents that run for minutes — their LiveTracker
+      // noise must stay hidden. We use writeDirect for our own output (bypasses
+      // suppression) and readline prompts go through process.stdout directly.
+      ctx.session.resumeAfterInteraction();
+      await ctx.orch.interactiveRoadmap(project, {
+        ask: (prompt) => ctx.session.question(prompt),
+        print: (text) => ctx.session.writeDirect(text),
+        collectMultiLine: (prompt) => ctx.session.collectMultiLine(prompt),
+      });
     },
   },
   {
     name: 'plan',
     aliases: [],
-    description: 'Queue planning jobs',
+    description: 'Queue planning jobs (standalone — /implement includes this)',
     usage: '/plan [project]',
     handler: async (ctx, args) => {
       await ctx.orch.plan(args[0]);
@@ -50,26 +83,118 @@ const commands: SlashCommand[] = [
   {
     name: 'implement',
     aliases: ['impl'],
-    description: 'Queue implementation jobs',
+    description: 'Unified pipeline: plan → implement → review (auto-enables worker)',
     usage: '/implement [project]',
     handler: async (ctx, args) => {
-      await ctx.orch.implement(args[0]);
+      let project = args[0];
+
+      // If no project specified, let the user pick
+      if (!project) {
+        const projects = ctx.orch.getProjectNames();
+        if (projects.length === 0) {
+          ctx.session.writeDirect(chalk.red('  No projects found.'));
+          return;
+        }
+        if (projects.length === 1) {
+          project = projects[0];
+        } else {
+          ctx.session.writeDirect(chalk.bold('\n  Select a project:\n'));
+          for (let i = 0; i < projects.length; i++) {
+            ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
+          }
+          ctx.session.writeDirect('');
+
+          const choice = await ctx.session.question(chalk.blue('  Project name or number: '));
+          const choiceNum = parseInt(choice, 10);
+          if (choiceNum >= 1 && choiceNum <= projects.length) {
+            project = projects[choiceNum - 1];
+          } else if (projects.includes(choice.trim())) {
+            project = choice.trim();
+          } else {
+            ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+            return;
+          }
+        }
+      }
+
+      // Run the unified implement session
+      const { startImplementSession } = await import('../workflow/stages/implement-session.js');
+      const { ImplementSessionStore } = await import('../state/implement-session.js');
+      const { resolve } = await import('node:path');
+
+      const forgeRoot = resolve(ctx.orch['settings'].workspaceRoot, '.forge');
+      const sessionStore = new ImplementSessionStore(forgeRoot);
+
+      await startImplementSession(project, {
+        store: ctx.orch['store'],
+        sessionStore,
+        queue: ctx.orch['queue'],
+        eventLog: ctx.orch['eventLog'],
+        enableWorker: () => ctx.session.enableWorker(),
+      }, {
+        ask: (prompt) => ctx.session.question(prompt),
+        print: (text) => ctx.session.writeDirect(text),
+      });
     },
   },
   {
     name: 'review',
     aliases: ['rev'],
-    description: 'Interactive PR triage and review',
+    description: 'Interactive review — automated reviews first, then user presentation',
     usage: '/review [project]',
     handler: async (ctx, args) => {
-      // Pause interceptor + status bar so the interactive triage
-      // can use the session's readline directly without cursor conflicts.
-      ctx.session.pauseForInteraction();
+      let project = args[0];
+
+      // If no project specified, let the user pick
+      if (!project) {
+        const projects = ctx.orch.getProjectNames();
+        if (projects.length === 0) {
+          ctx.session.writeDirect(chalk.red('  No projects found.'));
+          return;
+        }
+        if (projects.length === 1) {
+          project = projects[0];
+        } else {
+          ctx.session.writeDirect(chalk.bold('\n  Select a project for review:\n'));
+          for (let i = 0; i < projects.length; i++) {
+            ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
+          }
+          ctx.session.writeDirect('');
+
+          const choice = await ctx.session.question(chalk.blue('  Project name or number: '));
+          const choiceNum = parseInt(choice, 10);
+          if (choiceNum >= 1 && choiceNum <= projects.length) {
+            project = projects[choiceNum - 1];
+          } else if (projects.includes(choice.trim())) {
+            project = choice.trim();
+          } else {
+            ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+            return;
+          }
+        }
+      }
+
+      // Pause prompt refresh but keep console suppressed — the review
+      // spawns agents for handoff summaries whose LiveTracker noise
+      // must stay hidden. All user-facing output goes through writeDirect.
+      ctx.session.pauseForInteraction(/* keepSuppressed */ true);
       try {
-        await ctx.orch.interactiveReview(
-          args[0],
-          (prompt) => ctx.session.question(prompt),
-        );
+        await ctx.orch.newInteractiveReview(project, {
+          ask: (prompt) => ctx.session.question(prompt),
+          print: (text) => ctx.session.writeDirect(text),
+          collectMultiLine: (prompt) => ctx.session.collectMultiLine(prompt),
+        }, {
+          enableWorker: () => ctx.session.enableWorker(),
+          disableWorker: () => ctx.session.disableWorker(),
+          waitForReviewsDrained: (p) => {
+            if (!ctx.worker) throw new Error('Worker not available — start with /worker on');
+            return ctx.worker.waitForReviewsDrained(p);
+          },
+          waitForCloseOutsDrained: (p, prNumbers) => {
+            if (!ctx.worker) throw new Error('Worker not available — start with /worker on');
+            return ctx.worker.waitForCloseOutsDrained(p, prNumbers);
+          },
+        });
       } finally {
         ctx.session.resumeAfterInteraction();
       }
@@ -102,10 +227,40 @@ const commands: SlashCommand[] = [
   {
     name: 'reflect',
     aliases: [],
-    description: 'Queue a reflection job',
-    usage: '/reflect',
-    handler: async (ctx) => {
-      await ctx.orch.reflect();
+    description: 'Interactive reflection — forge introspection conversation',
+    usage: '/reflect [project]',
+    handler: async (ctx, args) => {
+      let project = args[0];
+
+      // If no project specified, let the user pick
+      if (!project) {
+        const projects = ctx.orch.getProjectNames();
+        if (projects.length === 0) {
+          ctx.session.writeDirect(chalk.red('  No projects found.'));
+          return;
+        }
+        ctx.session.writeDirect(chalk.bold('\n  Select project for reflection:\n'));
+        for (let i = 0; i < projects.length; i++) {
+          ctx.session.writeDirect(`  ${chalk.bold(`${i + 1}.`)} ${projects[i]}`);
+        }
+        const choice = await ctx.session.question(chalk.blue('\n  Project: '));
+        const choiceNum = parseInt(choice, 10);
+        if (choiceNum >= 1 && choiceNum <= projects.length) {
+          project = projects[choiceNum - 1];
+        } else if (projects.includes(choice.trim())) {
+          project = choice.trim();
+        } else {
+          ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+          return;
+        }
+      }
+
+      ctx.session.resumeAfterInteraction();
+      await ctx.orch.interactiveReflect(project, {
+        ask: (prompt) => ctx.session.question(prompt),
+        print: (text) => ctx.session.writeDirect(text),
+        collectMultiLine: (prompt) => ctx.session.collectMultiLine(prompt),
+      });
     },
   },
   // --- Info commands ---
@@ -154,6 +309,34 @@ const commands: SlashCommand[] = [
     usage: '/retry',
     handler: async (ctx) => {
       ctx.orch.retryFailed();
+    },
+  },
+
+  {
+    name: 'clean',
+    aliases: [],
+    description: 'Archive current cycle and reset for a new one',
+    usage: '/clean [--keep-roadmaps]',
+    handler: async (ctx, args) => {
+      const keepRoadmaps = args.includes('--keep-roadmaps');
+
+      console.log(chalk.bold('\n  This will archive:'));
+      console.log(chalk.dim('    - All work items'));
+      console.log(chalk.dim('    - All jobs'));
+      console.log(chalk.dim('    - Design briefs'));
+      console.log(chalk.dim('    - Events log'));
+      if (!keepRoadmaps) {
+        console.log(chalk.dim('    - Roadmaps (use --keep-roadmaps to preserve)'));
+      }
+      console.log(chalk.dim('    Learnings are always kept.\n'));
+
+      const confirm = await ctx.session.question(chalk.yellow('  Proceed? (y/N): '));
+      if (!/^y(es)?$/i.test(confirm.trim())) {
+        console.log(chalk.dim('  Cancelled.\n'));
+        return;
+      }
+
+      ctx.orch.archiveCycle({ keepRoadmaps });
     },
   },
 

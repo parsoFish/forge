@@ -18,6 +18,10 @@ import { resolve } from 'node:path';
 import chalk from 'chalk';
 import { loadAgents, type AgentRole, type AgentDefinition } from './agents/index.js';
 import { loadSettings, resolveProjectPath, type ForgeSettings } from './config/index.js';
+import type { Roadmap } from './workflow/types.js';
+import type { RoadmapSessionIO } from './workflow/stages/interactive-roadmap.js';
+import type { ReviewSessionIO } from './workflow/stages/interactive-review.js';
+import type { ReflectSessionIO } from './workflow/stages/interactive-reflect.js';
 import { StateStore } from './state/index.js';
 import { EventLog } from './events/index.js';
 import { BudgetTracker } from './budget/index.js';
@@ -283,151 +287,44 @@ export class Orchestrator {
   }
 
   /**
-   * Interactive review — triage PRs with user input before queuing.
+   * Interactive review — automated reviews first, then user presentation.
    *
-   * Shows each PR's intent and changes, lets the user accept, skip,
-   * or provide feedback that gets included in the review prompt.
-   * This replaces blind queue-all-and-go for the session's /review command.
+   * Replaces the old triage-first approach. Now runs automated code reviews
+   * for all PRs, presents results with rich context, collects scoped feedback,
+   * and creates close-out work items for autonomous processing.
+   *
+   * Requires a Worker reference for waitForReviewsDrained and worker control.
    */
-  async interactiveReview(projectName?: string, askFn?: (prompt: string) => Promise<string>): Promise<void> {
-    const { scanOpenPRs, interactiveTriagePRs } = await import('./workflow/stages/review-prs.js');
+  async newInteractiveReview(
+    project: string,
+    io: ReviewSessionIO,
+    workerControls: {
+      enableWorker: () => void;
+      disableWorker: () => void;
+      waitForReviewsDrained: (project: string) => Promise<void>;
+      waitForCloseOutsDrained: (project: string, prNumbers: readonly number[]) => Promise<void>;
+    },
+  ): Promise<void> {
+    this.validateProject(project);
 
     // Cancel stale queued review/pr-fix jobs
-    const cancelledReviews = this.queue.cancelByType('review', projectName ?? undefined);
-    const cancelledFixes = this.queue.cancelByType('pr-fix', projectName ?? undefined);
+    const cancelledReviews = this.queue.cancelByType('review', project);
+    const cancelledFixes = this.queue.cancelByType('pr-fix', project);
     if (cancelledReviews + cancelledFixes > 0) {
-      console.log(chalk.dim(`  Cancelled ${cancelledReviews + cancelledFixes} stale review/fix job(s) from previous run.`));
+      io.print(chalk.dim(`  Cancelled ${cancelledReviews + cancelledFixes} stale review/fix job(s) from previous run.`));
     }
 
-    const projects = projectName
-      ? (this.validateProject(projectName), [projectName])
-      : [...this.settings.projects];
+    this.setPhase('review', `Interactive review for ${project}`);
 
-    const prs = scanOpenPRs(projects, this.settings.workspaceRoot, this.settings.projectsDir);
-
-    if (prs.length === 0) {
-      console.log(chalk.dim('\n  No open PRs found.\n'));
-      return;
-    }
-
-    // Interactive triage — pass askFn to avoid creating a second readline
-    const decisions = await interactiveTriagePRs(prs, this.settings.workspaceRoot, this.settings.projectsDir, askFn);
-
-    const accepted = decisions.filter((d) => d.action !== 'skip');
-    if (accepted.length === 0) {
-      console.log(chalk.dim('  No PRs selected for review.\n'));
-      return;
-    }
-
-    // Chain consolidation: group accepted PRs by chain tip.
-    // For chains, we queue a single consolidated review job for the tip PR
-    // that includes feedback from all chain members. The tip branch already
-    // contains all ancestor commits — fixing only the tip is sufficient.
-    const chainGroups = new Map<number, typeof accepted>(); // tipPR# → decisions
-    const standalone: typeof accepted = [];
-
-    for (const d of accepted) {
-      const tipNum = d.pr.chainTipPR;
-      if (tipNum && tipNum !== d.pr.number) {
-        // This PR is part of a chain but not the tip — group it
-        const group = chainGroups.get(tipNum) ?? [];
-        group.push(d);
-        chainGroups.set(tipNum, group);
-      } else if (d.pr.chainMembers && d.pr.chainMembers.length > 1) {
-        // This IS the chain tip — start its group
-        const group = chainGroups.get(d.pr.number) ?? [];
-        group.push(d);
-        chainGroups.set(d.pr.number, group);
-      } else {
-        standalone.push(d);
-      }
-    }
-
-    const jobs: import('./jobs/types.js').Job[] = [];
-
-    // Queue standalone PR reviews normally
-    for (const d of standalone) {
-      jobs.push(this.queue.post('review', 'review', d.pr.project, {
-        prNumber:      d.pr.number,
-        prTitle:       d.pr.title,
-        prUrl:         d.pr.url,
-        branch:        d.pr.branch,
-        repo:          d.pr.repo,
-        project:       d.pr.project,
-        prCreatedAt:   d.pr.createdAt,
-        mergeLayer:    d.pr.mergeLayer,
-        dependsOnPRs:  d.pr.dependsOnPRs,
-        blocksPRs:     d.pr.blocksPRs,
-        uniqueHeadSha: d.pr.uniqueHeadSha,
-        ...(d.feedback ? { userFeedback: d.feedback } : {}),
-        userTriaged: true,
-      }, 5 + d.pr.mergeLayer));
-    }
-
-    // Queue consolidated review jobs for chains — one job per chain tip
-    for (const [tipNum, group] of chainGroups) {
-      // Find the tip PR's decision (it may or may not be in the accepted list)
-      const tipDecision = group.find((d) => d.pr.number === tipNum);
-      const tipPR = tipDecision?.pr ?? prs.find((pr) => pr.number === tipNum);
-      if (!tipPR) continue;
-
-      // Collect feedback from all chain members
-      const chainFeedback = group
-        .filter((d) => d.feedback)
-        .map((d) => `PR #${d.pr.number} (${d.pr.title}): ${d.feedback}`)
-        .join('\n');
-
-      // Collect all ancestor PR numbers for the consolidated close-on-merge
-      const ancestorPRs = (tipPR.chainMembers ?? []).filter((n) => n !== tipNum);
-
-      jobs.push(this.queue.post('review', 'review', tipPR.project, {
-        prNumber:      tipPR.number,
-        prTitle:       tipPR.title,
-        prUrl:         tipPR.url,
-        branch:        tipPR.branch,
-        repo:          tipPR.repo,
-        project:       tipPR.project,
-        prCreatedAt:   tipPR.createdAt,
-        mergeLayer:    0, // Chain tip gets priority — it's the only one that needs fixing
-        dependsOnPRs:  [],
-        blocksPRs:     [],
-        uniqueHeadSha: tipPR.uniqueHeadSha,
-        ...(chainFeedback ? { userFeedback: chainFeedback } : {}),
-        userTriaged: true,
-        // Chain consolidation metadata
-        isChainTip: true,
-        ancestorPRs,
-        chainSize: (tipPR.chainMembers ?? []).length,
-      }, 5));
-
-      // Log the chain consolidation
-      console.log(chalk.bold.cyan(`  Chain consolidation: ${ancestorPRs.length + 1} PRs → PR #${tipNum} (tip)`));
-      for (const d of group) {
-        const isTop = d.pr.number === tipNum ? chalk.bold(' ← tip') : '';
-        console.log(chalk.dim(`    PR #${d.pr.number}: ${d.pr.title}${isTop}`));
-      }
-      // Show ancestor PRs that weren't explicitly accepted but will be closed
-      for (const ancestorNum of ancestorPRs) {
-        if (!group.some((d) => d.pr.number === ancestorNum)) {
-          const ancestorPR = prs.find((pr) => pr.number === ancestorNum);
-          if (ancestorPR) {
-            console.log(chalk.dim(`    PR #${ancestorNum}: ${ancestorPR.title} (auto-included in chain)`));
-          }
-        }
-      }
-    }
-
-    console.log(chalk.bold.blue(`\n▶ Review: queued ${jobs.length} review job(s) (${chainGroups.size} chain(s), ${standalone.length} standalone)`));
-    for (const d of standalone) {
-      const layerLabel = d.pr.mergeLayer > 0 ? ` [layer ${d.pr.mergeLayer}]` : ' [foundation]';
-      const feedbackNote = d.feedback ? chalk.cyan(' +feedback') : '';
-      console.log(chalk.dim(`    [${d.pr.project}] PR #${d.pr.number}${layerLabel} — ${d.pr.title}${feedbackNote}`));
-    }
-
-    this.eventLog.emit({
-      type: 'jobs.queued',
-      summary: `Queued ${jobs.length} PR review jobs (${chainGroups.size} consolidated chain(s), ${standalone.length} standalone)`,
-    });
+    const { runInteractiveReview } = await import('./workflow/stages/interactive-review.js');
+    await runInteractiveReview(project, {
+      store: this.store,
+      queue: this.queue,
+      eventLog: this.eventLog,
+      settings: this.settings,
+      summaryAgent: this.requireAgent('architect'),
+      ...workerControls,
+    }, io);
   }
 
   /**
@@ -675,6 +572,108 @@ export class Orchestrator {
     const { runResearchAgent } = await import('./research/researcher.js');
     await runResearchAgent(researcher, this.store, this.settings.workspaceRoot);
     console.log(chalk.green('✓ Research complete\n'));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Interactive Commands (blocking — used by session)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Run an interactive roadmap session for a project.
+   *
+   * Unlike `roadmap()` which queues a fire-and-forget job, this runs a
+   * multi-phase conversation: discovery → direction → draft → refinement → approval.
+   * Blocks until the user approves or cancels.
+   */
+  async interactiveRoadmap(
+    projectName: string,
+    io: RoadmapSessionIO,
+  ): Promise<Roadmap | null> {
+    this.validateProject(projectName);
+    const architect = this.requireAgent('architect');
+    const projectPath = resolveProjectPath(this.settings, projectName);
+
+    const { runInteractiveRoadmap } = await import('./workflow/stages/interactive-roadmap.js');
+    const roadmap = await runInteractiveRoadmap(architect, projectName, projectPath, this.store, io);
+
+    if (roadmap) {
+      this.eventLog.emit({
+        type: 'roadmap.created',
+        summary: `Interactive roadmap approved for ${projectName}: ${roadmap.milestones.length} milestones`,
+      });
+    }
+
+    return roadmap;
+  }
+
+  /**
+   * Run an interactive reflection session for a project.
+   *
+   * Unlike the autonomous `reflect()` which queues a fire-and-forget job,
+   * this runs a multi-phase conversation: analysis → presentation →
+   * commentary → synthesis → approval. Blocks until the user approves or cancels.
+   *
+   * Reflect is forge introspection — it evaluates forge's process performance,
+   * not project direction. Project direction belongs in roadmapping.
+   */
+  async interactiveReflect(
+    projectName: string,
+    io: ReflectSessionIO,
+  ): Promise<string | null> {
+    this.validateProject(projectName);
+    const reflector = this.requireAgent('reflector');
+    const projectPath = resolveProjectPath(this.settings, projectName);
+
+    const { runInteractiveReflect } = await import('./workflow/stages/interactive-reflect.js');
+    const report = await runInteractiveReflect(
+      reflector, projectName, projectPath, this.store, this.eventLog, io,
+    );
+
+    if (report) {
+      this.eventLog.emit({
+        type: 'reflection.complete',
+        summary: `Interactive reflection completed for ${projectName}`,
+        project: projectName,
+      });
+    }
+
+    return report;
+  }
+
+  /**
+   * Archive the current cycle and reset for a new one.
+   *
+   * Moves work items, jobs, and events to `.forge/archive/cycle-{date}/`.
+   * Keeps learnings (valuable across cycles) and optionally roadmaps.
+   * Resets phase to 'roadmapping'.
+   */
+  archiveCycle(opts: { keepRoadmaps?: boolean } = {}): void {
+    const result = this.store.archiveCycle(opts);
+
+    console.log(chalk.bold.blue('\n  Cycle archived:\n'));
+    console.log(`  Work items: ${result.archivedWorkItems} archived`);
+    console.log(`  Jobs:       ${result.archivedJobs} archived`);
+    console.log(`  Phase:      reset to ${chalk.bold('roadmapping')}`);
+    console.log(chalk.dim(`  Archive:    ${result.archivePath}`));
+    console.log(chalk.dim(`  Learnings:  kept (valuable across cycles)`));
+    if (opts.keepRoadmaps) {
+      console.log(chalk.dim(`  Roadmaps:   kept (for continuity)`));
+    } else {
+      console.log(chalk.dim(`  Roadmaps:   archived (fresh start)`));
+    }
+    console.log();
+
+    this.eventLog.emit({
+      type: 'cycle.archived',
+      summary: `Cycle archived: ${result.archivedWorkItems} items, ${result.archivedJobs} jobs → ${result.archivePath}`,
+    });
+  }
+
+  /**
+   * Get the list of managed project names. Exposed for interactive commands.
+   */
+  getProjectNames(): readonly string[] {
+    return this.settings.projects;
   }
 
   // ═══════════════════════════════════════════════════════════════════

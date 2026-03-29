@@ -45,6 +45,7 @@ ${testContext}
 - [ ] Zero type errors
 - [ ] Code follows ecosystem conventions
 - [ ] No unintended side effects on existing functionality
+- [ ] Source-test pairing: every test import resolves to an existing source file
 
 ## If You Get Stuck
 

@@ -11,7 +11,7 @@
 import chalk from 'chalk';
 import type { AgentDefinition, AgentRole } from '../agents/types.js';
 import { StateStore } from '../state/store.js';
-import type { WorkItem } from './types.js';
+import type { WorkItem, WorkflowStage } from './types.js';
 import { STAGE_AGENT_MAP } from './types.js';
 import {
   runDesignStage,
@@ -79,6 +79,15 @@ export async function runWorkItemPipeline(
   console.log(chalk.bold(`\n  ┌─ Work Item: ${workItem.title}`));
   console.log(chalk.dim(`  │  Branch: ${workItem.branch}`));
 
+  // Auto-advance past stages that already have recorded output
+  const advancedStage = resolveCurrentStage(workItem);
+  if (advancedStage !== workItem.stage) {
+    console.log(chalk.dim(`  │  Stage auto-advanced: ${workItem.stage} → ${advancedStage}`));
+    workItem.stage = advancedStage;
+    workItem.updatedAt = new Date().toISOString();
+    store.saveWorkItem(workItem);
+  }
+
   // Test stage
   if (workItem.stage === 'test' && workItem.status === 'pending') {
     const testAgent = agents.get(STAGE_AGENT_MAP.test);
@@ -133,6 +142,20 @@ export async function runWorkItemPipeline(
   }
 
   console.log(chalk.dim('  └─ Done'));
+}
+
+/**
+ * Walk pipeline stages and return the first stage without recorded output.
+ * Prevents items from getting stuck at already-completed stages after crashes.
+ */
+function resolveCurrentStage(workItem: WorkItem): WorkflowStage {
+  const pipelineStages: readonly WorkflowStage[] = ['test', 'develop', 'pr', 'review'];
+  for (const stage of pipelineStages) {
+    if (!workItem.stageOutputs[stage]) {
+      return stage;
+    }
+  }
+  return 'review';
 }
 
 /**

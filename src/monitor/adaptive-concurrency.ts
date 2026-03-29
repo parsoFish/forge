@@ -95,10 +95,33 @@ export class AdaptiveConcurrency {
    * The worker should compare this to its current active count to decide
    * whether to claim more jobs or stop claiming.
    */
-  evaluate(currentActive: number, pendingJobTypes?: Array<{ type: string; project?: string }>): ConcurrencyDecision {
+  /**
+   * Calculate how many agents should be running right now.
+   *
+   * Called each worker tick. Uses smoothed metrics to avoid thrashing.
+   * The worker should compare this to its current active count to decide
+   * whether to claim more jobs or stop claiming.
+   *
+   * @param effectiveSlotCeiling — when all pending jobs require resource slots
+   *   (e.g. build), this caps the target to the slot capacity. Without this,
+   *   the scaler thinks it can run `ceiling` agents but only `slotCapacity`
+   *   can actually execute, causing burst behavior when slots free up.
+   */
+  evaluate(
+    currentActive: number,
+    pendingJobTypes?: Array<{ type: string; project?: string }>,
+    effectiveSlotCeiling?: number,
+  ): ConcurrencyDecision {
     const health = this.resources.check();
     this.updateSmoothedCpu(health);
     this.ticksSinceChange++;
+
+    // Effective ceiling: the lower of the configured ceiling and the slot
+    // constraint. This prevents the scaler from "banking" a high target
+    // that it can't actually fill, avoiding burst-then-block behavior.
+    const ceiling = effectiveSlotCeiling !== undefined
+      ? Math.max(this.config.floor, Math.min(this.config.ceiling, effectiveSlotCeiling))
+      : this.config.ceiling;
 
     const availMb = health.availableMemoryMb;
 
@@ -115,7 +138,7 @@ export class AdaptiveConcurrency {
     // Asymmetric debounce:
     // - Scale UP requires longer cooldown (let new agents' CPU impact settle)
     // - Scale DOWN responds faster (protect the system)
-    const wantingUp = this.smoothedCpu < this.config.targetCpuLoad && currentActive < this.config.ceiling;
+    const wantingUp = this.smoothedCpu < this.config.targetCpuLoad && currentActive < ceiling;
     const cooldown = wantingUp ? this.config.scaleUpCooldownTicks : this.config.scaleDownCooldownTicks;
 
     if (this.ticksSinceChange < cooldown) {
@@ -139,9 +162,9 @@ export class AdaptiveConcurrency {
 
     const memTarget = memorySlots + currentActive;
 
-    // Take the minimum of CPU and memory targets, clamped to [floor, ceiling]
+    // Take the minimum of CPU, memory, and slot targets, clamped to [floor, ceiling]
     const rawTarget = Math.min(cpuTarget, memTarget);
-    const target = Math.max(this.config.floor, Math.min(this.config.ceiling, rawTarget));
+    const target = Math.max(this.config.floor, Math.min(ceiling, rawTarget));
 
     // Only step by ±1 per evaluation to avoid dramatic swings
     const steppedTarget = target > this.lastTarget
@@ -150,13 +173,13 @@ export class AdaptiveConcurrency {
         ? this.lastTarget - 1
         : this.lastTarget;
 
-    const clampedTarget = Math.max(this.config.floor, Math.min(this.config.ceiling, steppedTarget));
+    const clampedTarget = Math.max(this.config.floor, Math.min(ceiling, steppedTarget));
 
     const reason = clampedTarget > currentActive
-      ? `scaling up (CPU ${(this.smoothedCpu * 100).toFixed(0)}% < ${(this.config.targetCpuLoad * 100).toFixed(0)}% target, ${availMb}MB free)`
+      ? `scaling up (CPU ${(this.smoothedCpu * 100).toFixed(0)}% < ${(this.config.targetCpuLoad * 100).toFixed(0)}% target, ${availMb}MB free${ceiling < this.config.ceiling ? `, slot-capped ${ceiling}` : ''})`
       : clampedTarget < currentActive
         ? `scaling down (CPU ${(this.smoothedCpu * 100).toFixed(0)}%, mem ${availMb}MB)`
-        : `steady (CPU ${(this.smoothedCpu * 100).toFixed(0)}%, ${availMb}MB free)`;
+        : `steady (CPU ${(this.smoothedCpu * 100).toFixed(0)}%, ${availMb}MB free${ceiling < this.config.ceiling ? `, slot-capped ${ceiling}` : ''})`;
 
     return this.decide(clampedTarget, health, false, reason);
   }
