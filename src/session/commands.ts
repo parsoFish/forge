@@ -41,6 +41,7 @@ const commands: SlashCommand[] = [
           ctx.session.writeDirect(chalk.red('  No projects found.'));
           return;
         }
+        ctx.session.pauseForInteraction();
         ctx.session.writeDirect(chalk.bold('\n  Select a project for roadmapping:\n'));
         for (let i = 0; i < projects.length; i++) {
           ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
@@ -55,14 +56,14 @@ const commands: SlashCommand[] = [
           project = choice.trim();
         } else {
           ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+          ctx.session.resumeAfterInteraction();
           return;
         }
       }
 
-      // Re-suppress background output. The REPL unsuppresses for all commands,
-      // but /roadmap spawns agents that run for minutes — their LiveTracker
-      // noise must stay hidden. We use writeDirect for our own output (bypasses
-      // suppression) and readline prompts go through process.stdout directly.
+      // Re-suppress background output. /roadmap spawns agents that run for
+      // minutes — their LiveTracker noise must stay hidden. We use writeDirect
+      // for our own output and readline prompts go through process.stdout.
       ctx.session.resumeAfterInteraction();
       await ctx.orch.interactiveRoadmap(project, {
         ask: (prompt) => ctx.session.question(prompt),
@@ -98,6 +99,7 @@ const commands: SlashCommand[] = [
         if (projects.length === 1) {
           project = projects[0];
         } else {
+          ctx.session.pauseForInteraction();
           ctx.session.writeDirect(chalk.bold('\n  Select a project:\n'));
           for (let i = 0; i < projects.length; i++) {
             ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
@@ -105,6 +107,7 @@ const commands: SlashCommand[] = [
           ctx.session.writeDirect('');
 
           const choice = await ctx.session.question(chalk.blue('  Project name or number: '));
+          ctx.session.resumeAfterInteraction();
           const choiceNum = parseInt(choice, 10);
           if (choiceNum >= 1 && choiceNum <= projects.length) {
             project = projects[choiceNum - 1];
@@ -155,6 +158,7 @@ const commands: SlashCommand[] = [
         if (projects.length === 1) {
           project = projects[0];
         } else {
+          ctx.session.pauseForInteraction();
           ctx.session.writeDirect(chalk.bold('\n  Select a project for review:\n'));
           for (let i = 0; i < projects.length; i++) {
             ctx.session.writeDirect(`  ${chalk.cyan(`${i + 1}.`)} ${projects[i]}`);
@@ -162,6 +166,7 @@ const commands: SlashCommand[] = [
           ctx.session.writeDirect('');
 
           const choice = await ctx.session.question(chalk.blue('  Project name or number: '));
+          ctx.session.resumeAfterInteraction();
           const choiceNum = parseInt(choice, 10);
           if (choiceNum >= 1 && choiceNum <= projects.length) {
             project = projects[choiceNum - 1];
@@ -239,11 +244,13 @@ const commands: SlashCommand[] = [
           ctx.session.writeDirect(chalk.red('  No projects found.'));
           return;
         }
+        ctx.session.pauseForInteraction();
         ctx.session.writeDirect(chalk.bold('\n  Select project for reflection:\n'));
         for (let i = 0; i < projects.length; i++) {
           ctx.session.writeDirect(`  ${chalk.bold(`${i + 1}.`)} ${projects[i]}`);
         }
         const choice = await ctx.session.question(chalk.blue('\n  Project: '));
+        ctx.session.resumeAfterInteraction();
         const choiceNum = parseInt(choice, 10);
         if (choiceNum >= 1 && choiceNum <= projects.length) {
           project = projects[choiceNum - 1];
@@ -320,23 +327,28 @@ const commands: SlashCommand[] = [
     handler: async (ctx, args) => {
       const keepRoadmaps = args.includes('--keep-roadmaps');
 
-      console.log(chalk.bold('\n  This will archive:'));
-      console.log(chalk.dim('    - All work items'));
-      console.log(chalk.dim('    - All jobs'));
-      console.log(chalk.dim('    - Design briefs'));
-      console.log(chalk.dim('    - Events log'));
-      if (!keepRoadmaps) {
-        console.log(chalk.dim('    - Roadmaps (use --keep-roadmaps to preserve)'));
-      }
-      console.log(chalk.dim('    Learnings are always kept.\n'));
+      ctx.session.pauseForInteraction();
+      try {
+        console.log(chalk.bold('\n  This will archive:'));
+        console.log(chalk.dim('    - All work items'));
+        console.log(chalk.dim('    - All jobs'));
+        console.log(chalk.dim('    - Design briefs'));
+        console.log(chalk.dim('    - Events log'));
+        if (!keepRoadmaps) {
+          console.log(chalk.dim('    - Roadmaps (use --keep-roadmaps to preserve)'));
+        }
+        console.log(chalk.dim('    Learnings are always kept.\n'));
 
-      const confirm = await ctx.session.question(chalk.yellow('  Proceed? (y/N): '));
-      if (!/^y(es)?$/i.test(confirm.trim())) {
-        console.log(chalk.dim('  Cancelled.\n'));
-        return;
-      }
+        const confirm = await ctx.session.question(chalk.yellow('  Proceed? (y/N): '));
+        if (!/^y(es)?$/i.test(confirm.trim())) {
+          console.log(chalk.dim('  Cancelled.\n'));
+          return;
+        }
 
-      ctx.orch.archiveCycle({ keepRoadmaps });
+        ctx.orch.archiveCycle({ keepRoadmaps });
+      } finally {
+        ctx.session.resumeAfterInteraction();
+      }
     },
   },
 
