@@ -227,10 +227,40 @@ const commands: SlashCommand[] = [
   {
     name: 'reflect',
     aliases: [],
-    description: 'Queue a reflection job',
-    usage: '/reflect',
-    handler: async (ctx) => {
-      await ctx.orch.reflect();
+    description: 'Interactive reflection — forge introspection conversation',
+    usage: '/reflect [project]',
+    handler: async (ctx, args) => {
+      let project = args[0];
+
+      // If no project specified, let the user pick
+      if (!project) {
+        const projects = ctx.orch.getProjectNames();
+        if (projects.length === 0) {
+          ctx.session.writeDirect(chalk.red('  No projects found.'));
+          return;
+        }
+        ctx.session.writeDirect(chalk.bold('\n  Select project for reflection:\n'));
+        for (let i = 0; i < projects.length; i++) {
+          ctx.session.writeDirect(`  ${chalk.bold(`${i + 1}.`)} ${projects[i]}`);
+        }
+        const choice = await ctx.session.question(chalk.blue('\n  Project: '));
+        const choiceNum = parseInt(choice, 10);
+        if (choiceNum >= 1 && choiceNum <= projects.length) {
+          project = projects[choiceNum - 1];
+        } else if (projects.includes(choice.trim())) {
+          project = choice.trim();
+        } else {
+          ctx.session.writeDirect(chalk.red(`  Unknown project: ${choice}`));
+          return;
+        }
+      }
+
+      ctx.session.resumeAfterInteraction();
+      await ctx.orch.interactiveReflect(project, {
+        ask: (prompt) => ctx.session.question(prompt),
+        print: (text) => ctx.session.writeDirect(text),
+        collectMultiLine: (prompt) => ctx.session.collectMultiLine(prompt),
+      });
     },
   },
   // --- Info commands ---

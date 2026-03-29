@@ -62,7 +62,9 @@ export type EventType =
   | 'session.resume'
   | 'session.complete'
   | 'job.shed'
-  | 'review.drift';
+  | 'review.drift'
+  | 'health.check.pass'
+  | 'health.check.fail';
 
 export interface ForgeEvent {
   readonly timestamp: string;

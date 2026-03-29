@@ -21,6 +21,7 @@ import { loadSettings, resolveProjectPath, type ForgeSettings } from './config/i
 import type { Roadmap } from './workflow/types.js';
 import type { RoadmapSessionIO } from './workflow/stages/interactive-roadmap.js';
 import type { ReviewSessionIO } from './workflow/stages/interactive-review.js';
+import type { ReflectSessionIO } from './workflow/stages/interactive-reflect.js';
 import { StateStore } from './state/index.js';
 import { EventLog } from './events/index.js';
 import { BudgetTracker } from './budget/index.js';
@@ -603,6 +604,40 @@ export class Orchestrator {
     }
 
     return roadmap;
+  }
+
+  /**
+   * Run an interactive reflection session for a project.
+   *
+   * Unlike the autonomous `reflect()` which queues a fire-and-forget job,
+   * this runs a multi-phase conversation: analysis → presentation →
+   * commentary → synthesis → approval. Blocks until the user approves or cancels.
+   *
+   * Reflect is forge introspection — it evaluates forge's process performance,
+   * not project direction. Project direction belongs in roadmapping.
+   */
+  async interactiveReflect(
+    projectName: string,
+    io: ReflectSessionIO,
+  ): Promise<string | null> {
+    this.validateProject(projectName);
+    const reflector = this.requireAgent('reflector');
+    const projectPath = resolveProjectPath(this.settings, projectName);
+
+    const { runInteractiveReflect } = await import('./workflow/stages/interactive-reflect.js');
+    const report = await runInteractiveReflect(
+      reflector, projectName, projectPath, this.store, this.eventLog, io,
+    );
+
+    if (report) {
+      this.eventLog.emit({
+        type: 'reflection.complete',
+        summary: `Interactive reflection completed for ${projectName}`,
+        project: projectName,
+      });
+    }
+
+    return report;
   }
 
   /**

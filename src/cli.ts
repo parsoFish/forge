@@ -144,12 +144,39 @@ program
   });
 
 program
-  .command('reflect')
-  .description('Queue a reflection/learning job (exits immediately)')
-  .action(async () => {
+  .command('reflect [project]')
+  .description('Queue a reflection job, or run interactively with --interactive')
+  .option('-i, --interactive', 'Run interactive reflection session (blocking)')
+  .action(async (project?: string, opts?: { interactive?: boolean }) => {
     try {
       const orch = new Orchestrator();
-      await orch.reflect();
+      if (opts?.interactive && project) {
+        // Interactive mode — blocking conversation
+        const readline = await import('node:readline');
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        const ask = (prompt: string) =>
+          new Promise<string>((resolve) => rl.question(prompt, resolve));
+        const collectMultiLine = async (prompt: string) => {
+          process.stdout.write(prompt);
+          const lines: string[] = [];
+          for await (const line of rl) {
+            if (line.trim() === '') break;
+            lines.push(line);
+          }
+          return lines.join('\n');
+        };
+        await orch.interactiveReflect(project, {
+          ask,
+          print: (text) => process.stdout.write(text + '\n'),
+          collectMultiLine,
+        });
+        rl.close();
+      } else {
+        await orch.reflect();
+      }
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : error);
       process.exit(1);

@@ -74,7 +74,7 @@ export const DEFAULT_THRESHOLDS: ResourceThresholds = {
   maxLoadFactor: 0.80,          // Don't exceed 80% of cores
   maxMemoryUsage: 0.85,         // Leave 15% memory headroom
   minAvailableMemoryMb: 1500,   // Need at least 1.5GB free to spawn another agent
-  checkIntervalMs: 5000,        // Check every 5s at most
+  checkIntervalMs: 2000,        // Check every 2s at most (was 5s — too slow for spike detection)
   resourceSlots: DEFAULT_RESOURCE_SLOTS,
 };
 
